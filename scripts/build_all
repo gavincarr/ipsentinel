@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Rebuild the ipsentinel binary into bin/ at the repo root.
+#
+# ipsentinel is a single-binary module built from the repo root, so this is the
+# root-package counterpart to the cmd/*-based build_all used in sibling repos
+# (see ../profound/urldb/scripts/build_all).
+#
+# Usage: scripts/build_all
+
+set -u
+
+repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+bin_dir="${repo_root}/bin"
+name="$(basename "${repo_root}")"
+
+mkdir -p "${bin_dir}"
+
+printf 'build: %s\n' "${name}"
+if (cd "${repo_root}" && go build -buildvcs=false -o "${bin_dir}/${name}" .); then
+    echo "built ${name} ok"
+else
+    echo "build ${name} failed" >&2
+    exit 1
+fi

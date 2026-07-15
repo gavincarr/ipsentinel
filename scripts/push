@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Run from the script's own directory so the relative paths below
+# (push.list, .) resolve regardless of caller cwd. CDPATH= prefix prevents a
+# user-set CDPATH from redirecting cd to an unrelated dir or printing
+# the resolved path to stdout; -- guards against an exotic $0.
+CDPATH= cd -- "$(dirname -- "$0")/../bin" || exit 1
+
+usage() {
+  echo "usage: $(basename $0) [<rsync_opts>] <hostname> [<remote_path>]"
+  exit 2
+}
+
+# Collect any leading rsync options, then positional <hostname> [<remote_path>].
+opts=()
+while [ -n "$1" ] && [ "$1" != "${1#-}" ]; do
+  opts+=("$1")
+  shift
+done
+
+HOST=$1
+test -n "$HOST" || usage
+REMOTE_PATH=${2:-/etc/local/bin}
+
+rsync -clpt --progress --files-from=../scripts/push.list "${opts[@]}" . "root@$HOST:$REMOTE_PATH"
