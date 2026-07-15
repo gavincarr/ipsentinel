@@ -8,6 +8,7 @@
 /.netrc
 /DevNotes*
 /TODO*
+/bin/*
 /c.out
 /go.work*
 /data/*
