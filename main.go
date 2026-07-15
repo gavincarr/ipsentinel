@@ -30,6 +30,7 @@ import (
 type CLI struct {
 	Concurrency int           `kong:"short='c',default='8',help='Number of ssh checks to run in parallel.'"`
 	Timeout     time.Duration `kong:"short='t',default='10s',help='Per-check ssh timeout.'"`
+	Strip       bool          `kong:"short='s',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
 	Verbose     bool          `kong:"short='v',help='Enable verbose (debug) logging.'"`
 }
 
@@ -44,6 +45,14 @@ type Check struct {
 // -oProxyCommand=...), and is restricted to characters valid in hostnames and
 // ~/.ssh/config Host aliases.
 var validHostname = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._-]*$`)
+
+// stripHostname returns the leftmost DNS label of host (foo.example.com => foo).
+// A host with no dot is returned unchanged. Used by the -s/--strip flag so
+// fully-qualified input names can drive ssh via short ~/.ssh/config aliases.
+func stripHostname(host string) string {
+	label, _, _ := strings.Cut(host, ".")
+	return label
+}
 
 // Alerter posts alerts about failed checks. The MVP ships a LogAlerter; real
 // sinks (Slack, email, ...) can be added as drop-in implementations.
@@ -93,7 +102,7 @@ func main() {
 func run(cli CLI, log *slog.Logger, r io.Reader) int {
 	alerter := LogAlerter{log: log}
 
-	checks, parseFailures := parseInput(r, alerter)
+	checks, parseFailures := parseInput(r, alerter, cli.Strip)
 	if parseFailures > 0 {
 		log.Warn("input had malformed lines", "count", parseFailures)
 	}
@@ -133,8 +142,10 @@ func run(cli CLI, log *slog.Logger, r io.Reader) int {
 
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
 // lines beginning with '#' are ignored. Malformed lines are alerted and
-// counted; it returns the valid checks plus the malformed-line count.
-func parseInput(r io.Reader, alerter Alerter) ([]Check, int) {
+// counted; it returns the valid checks plus the malformed-line count. When
+// strip is set, each validated hostname is reduced to its leftmost DNS label
+// before being stored (see stripHostname).
+func parseInput(r io.Reader, alerter Alerter, strip bool) ([]Check, int) {
 	var checks []Check
 	var failures int
 
@@ -156,6 +167,9 @@ func parseInput(r io.Reader, alerter Alerter) ([]Check, int) {
 			alerter.Alert(Check{Hostname: host, IP: ip}, "invalid hostname", fmt.Errorf("%q", host))
 			failures++
 			continue
+		}
+		if strip {
+			host = stripHostname(host)
 		}
 		checks = append(checks, Check{Hostname: host, IP: ip})
 	}

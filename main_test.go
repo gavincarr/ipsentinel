@@ -35,7 +35,7 @@ func TestParseInput(t *testing.T) {
 	}, "\n")
 
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter)
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false)
 
 	wantChecks := []Check{
 		{"host1", "10.0.0.1"},
@@ -64,7 +64,7 @@ func TestParseInput(t *testing.T) {
 
 func TestParseInputRejectsFlagSmuggling(t *testing.T) {
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter)
+	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false)
 
 	if len(checks) != 0 {
 		t.Fatalf("flag-smuggling host was accepted as a check: %+v", checks)
@@ -74,6 +74,49 @@ func TestParseInputRejectsFlagSmuggling(t *testing.T) {
 	}
 	if len(alerter.alerts) != 1 || alerter.alerts[0].reason != "invalid hostname" {
 		t.Errorf("expected one 'invalid hostname' alert, got %+v", alerter.alerts)
+	}
+}
+
+func TestStripHostname(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"foo.example.com", "foo"},
+		{"a.b.example.com", "a"},
+		{"host", "host"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := stripHostname(tt.in); got != tt.want {
+			t.Errorf("stripHostname(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParseInputStrip(t *testing.T) {
+	input := "foo.example.com,10.0.0.1\nbar,10.0.0.2\n"
+
+	// strip=true reduces each validated hostname to its leftmost label.
+	var alerter captureAlerter
+	checks, failures := parseInput(strings.NewReader(input), &alerter, true)
+	wantStripped := []Check{{"foo", "10.0.0.1"}, {"bar", "10.0.0.2"}}
+	if failures != 0 {
+		t.Fatalf("got %d failures, want 0", failures)
+	}
+	if len(checks) != len(wantStripped) {
+		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(wantStripped), checks)
+	}
+	for i, want := range wantStripped {
+		if checks[i] != want {
+			t.Errorf("strip=true check[%d] = %+v, want %+v", i, checks[i], want)
+		}
+	}
+
+	// strip=false leaves the hostname untouched (existing behaviour).
+	var alerter2 captureAlerter
+	checks, _ = parseInput(strings.NewReader(input), &alerter2, false)
+	if checks[0].Hostname != "foo.example.com" {
+		t.Errorf("strip=false altered hostname: got %q, want %q", checks[0].Hostname, "foo.example.com")
 	}
 }
 
