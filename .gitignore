@@ -15,6 +15,7 @@
 /delta/applied/*
 /dist/*
 /go.work*
+/ipsentinel
 /node_modules/*
 /pkg/linux_amd64/*
 /pkg/*.*/
