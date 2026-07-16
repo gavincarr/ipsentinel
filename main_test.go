@@ -158,6 +158,42 @@ func TestParseInputStripDomain(t *testing.T) {
 	}
 }
 
+func TestParseInputValidatesIP(t *testing.T) {
+	input := strings.Join([]string{
+		"host1,10.0.0.1",           // valid ipv4, canonical
+		"host2,not-an-ip",          // invalid: not an address
+		"host3,10.0.0.999",         // invalid: octet out of range
+		"host4,10.0.0.1/24",        // invalid: CIDR, not a bare address
+		"host5,FE80::1",            // valid ipv6, canonicalized to fe80::1
+		"host6,fe80:0:0:0:0:0:0:1", // valid ipv6, canonicalized (compressed)
+	}, "\n")
+
+	var alerter captureAlerter
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "")
+
+	want := []Check{
+		{"host1", "10.0.0.1"},
+		{"host5", "fe80::1"},
+		{"host6", "fe80::1"},
+	}
+	if failures != 3 {
+		t.Errorf("got %d failures, want 3", failures)
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(want), checks)
+	}
+	for i, w := range want {
+		if checks[i] != w {
+			t.Errorf("check[%d] = %+v, want %+v", i, checks[i], w)
+		}
+	}
+	for _, a := range alerter.alerts {
+		if a.reason != "invalid ip" {
+			t.Errorf("unexpected alert reason %q, want %q", a.reason, "invalid ip")
+		}
+	}
+}
+
 func TestIPPresent(t *testing.T) {
 	// Representative `ip address` output.
 	out := `2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500

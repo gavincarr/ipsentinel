@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"regexp"
@@ -155,8 +156,9 @@ func run(cli CLI, log *slog.Logger, r io.Reader) int {
 }
 
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
-// lines beginning with '#' are ignored. Malformed lines are alerted and
-// counted; it returns the valid checks plus the malformed-line count. When
+// lines beginning with '#' are ignored. Malformed lines, invalid hostnames, and
+// unparseable ips are alerted and counted; it returns the valid checks plus the
+// failure count. Each ip is parsed and stored in its canonical text form. When
 // domain is non-empty, that suffix is stripped from each validated hostname
 // (see stripDomain); when stripAll is set, the hostname is then reduced to its
 // leftmost DNS label (see stripHostname).
@@ -183,6 +185,15 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string) ([]C
 			failures++
 			continue
 		}
+		addr, err := netip.ParseAddr(ip)
+		if err != nil {
+			alerter.Alert(Check{Hostname: host, IP: ip}, "invalid ip", fmt.Errorf("%q", ip))
+			failures++
+			continue
+		}
+		// Store the canonical text form so matching against `ip address`
+		// output is spelling-insensitive (e.g. FE80::1 => fe80::1).
+		ip = addr.String()
 		if domain != "" {
 			host = stripDomain(host, domain)
 		}
