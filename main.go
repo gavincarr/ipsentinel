@@ -29,7 +29,8 @@ import (
 
 // CLI holds the command-line configuration.
 type CLI struct {
-	Concurrency int           `kong:"short='c',default='8',help='Number of ssh checks to run in parallel.'"`
+	Config      string        `kong:"short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
+	Concurrency int           `kong:"short='C',default='8',help='Number of ssh checks to run in parallel.'"`
 	Timeout     time.Duration `kong:"short='t',default='10s',help='Per-check ssh timeout.'"`
 	Strip       string        `kong:"short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
 	StripAll    bool          `kong:"short='S',name='strip-all',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
@@ -109,7 +110,17 @@ func main() {
 
 	cli.Concurrency = max(cli.Concurrency, 1)
 
-	os.Exit(run(cli, nil, log, os.Stdin))
+	var config map[string]HostConfig
+	if cli.Config != "" {
+		var err error
+		config, err = loadConfig(cli.Config)
+		if err != nil {
+			log.Error("loading config", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	os.Exit(run(cli, config, log, os.Stdin))
 }
 
 // run reads checks from r, runs them, and returns the process exit code
