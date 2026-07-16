@@ -218,20 +218,32 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 	return checks, failures
 }
 
-// runCheck runs `ssh <hostname> ip address` and confirms the expected ip is
-// present in the output. BatchMode avoids password prompts so an unreachable or
-// auth-failing host fails fast rather than hanging. ~/.ssh/config is honoured
-// because we invoke the real ssh binary.
+// sshArgs builds the ssh argv for c: batch-mode options, the target host,
+// and the remote command for the check's type. Unknown or empty types fall
+// back to the default so a zero-value Check still runs a sane command.
+func sshArgs(c Check, connectTimeoutSeconds int) []string {
+	command, ok := checkCommands[c.Type]
+	if !ok {
+		command = checkCommands[defaultCheckType]
+	}
+	return []string{
+		"-o", "BatchMode=yes",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds),
+		"--", c.Hostname, command,
+	}
+}
+
+// runCheck runs the check's remote command via ssh (see checkCommands) and
+// confirms the expected ip is present in the output. BatchMode avoids
+// password prompts so an unreachable or auth-failing host fails fast rather
+// than hanging. ~/.ssh/config is honoured because we invoke the real ssh
+// binary.
 func runCheck(ctx context.Context, timeout time.Duration, c Check) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	seconds := max(int(timeout.Seconds()), 1)
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-o", "BatchMode=yes",
-		"-o", fmt.Sprintf("ConnectTimeout=%d", seconds),
-		"--", c.Hostname, "ip", "address",
-	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgs(c, seconds)...)
 
 	out, err := cmd.Output()
 	if err != nil {

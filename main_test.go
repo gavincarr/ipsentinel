@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -276,5 +277,32 @@ func TestValidHostname(t *testing.T) {
 		if validHostname.MatchString(h) {
 			t.Errorf("validHostname accepted invalid hostname %q", h)
 		}
+	}
+}
+
+func TestSSHArgs(t *testing.T) {
+	c := Check{Hostname: "web1", IP: "10.0.0.1", Type: "iproute2"}
+	want := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "web1", "ip address"}
+	if got := sshArgs(c, 10); !slices.Equal(got, want) {
+		t.Errorf("sshArgs(iproute2) = %q, want %q", got, want)
+	}
+
+	// aws type: same argv shape, remote command is the IMDS snippet.
+	c.Type = "aws"
+	got := sshArgs(c, 10)
+	if len(got) != len(want) {
+		t.Fatalf("sshArgs(aws) has %d args, want %d: %q", len(got), len(want), got)
+	}
+	remote := got[len(got)-1]
+	if !strings.Contains(remote, "ip address") || !strings.Contains(remote, "169.254.169.254") {
+		t.Errorf("aws remote command missing expected content: %q", remote)
+	}
+
+	// Unknown or empty type falls back to the default command, so a
+	// zero-value Check still runs a sane check.
+	c.Type = ""
+	got = sshArgs(c, 10)
+	if got[len(got)-1] != "ip address" {
+		t.Errorf("empty type remote command = %q, want %q", got[len(got)-1], "ip address")
 	}
 }
