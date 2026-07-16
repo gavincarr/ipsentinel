@@ -41,6 +41,32 @@ Or reduce every hostname to its leftmost label with `-S`/`--strip-all`
 list of options.
 
 
+Configuration file
+------------------
+
+Some checks need per-host settings — most notably AWS EC2 instances,
+whose public IP is a 1:1 NAT mapping held in AWS infrastructure rather
+than configured on the instance, so it never appears in `ip address`
+output. Pass a YAML config file with `-c`/`--config`, keyed by hostname
+*as it appears on stdin* (before any `-s`/`-S` stripping):
+
+    web1.example.com:
+      type: aws
+    web2.example.com:
+      type: iproute2
+
+Supported per-host keys:
+
+- `type`: the check type — `iproute2` (the default: run `ip address`
+  and look for the expected ip) or `aws` (additionally query the EC2
+  Instance Metadata Service for the instance's public IPv4, so both
+  private and public addresses can be verified).
+
+Hosts absent from the config file (or with no `type`) use `iproute2`.
+Config entries for hosts not present on stdin are ignored, so one
+config file can cover a superset of any given input.
+
+
 Author
 ------
 
