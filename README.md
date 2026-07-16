@@ -9,6 +9,12 @@ in that output. On any error (eg ssh errors OR if ip is not found)
 it reports an error.
 
 
+Installation
+------------
+
+    go install github.com/gavincarr/ipsentinel@latest
+
+
 Author
 ------
 
