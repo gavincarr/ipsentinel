@@ -132,11 +132,12 @@ func run(cli CLI, log *slog.Logger, r io.Reader) int {
 	wg.Wait()
 
 	n := failures.Load()
+	successes := len(checks) - (int(n) - parseFailures)
 	if n > 0 {
-		log.Info("finished with failures", "checks", len(checks), "failures", n)
+		log.Info("finished with failures", "checks", len(checks), "successes", successes, "failures", n)
 		return 1
 	}
-	log.Info("all checks passed", "checks", len(checks))
+	log.Info("all checks passed", "checks", len(checks), "successes", successes)
 	return 0
 }
 
