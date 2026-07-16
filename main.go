@@ -40,6 +40,7 @@ type CLI struct {
 type Check struct {
 	Hostname string
 	IP       string
+	Type     string // check type: a checkCommands key, resolved by parseInput
 }
 
 // validHostname guards against argv flag smuggling: a hostname read from stdin
@@ -108,15 +109,15 @@ func main() {
 
 	cli.Concurrency = max(cli.Concurrency, 1)
 
-	os.Exit(run(cli, log, os.Stdin))
+	os.Exit(run(cli, nil, log, os.Stdin))
 }
 
 // run reads checks from r, runs them, and returns the process exit code
 // (0 = all passed, 1 = one or more failures).
-func run(cli CLI, log *slog.Logger, r io.Reader) int {
+func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) int {
 	alerter := LogAlerter{log: log}
 
-	checks, parseFailures := parseInput(r, alerter, cli.StripAll, cli.Strip)
+	checks, parseFailures := parseInput(r, alerter, cli.StripAll, cli.Strip, config)
 	if parseFailures > 0 {
 		log.Warn("input had malformed lines", "count", parseFailures)
 	}
@@ -161,8 +162,10 @@ func run(cli CLI, log *slog.Logger, r io.Reader) int {
 // failure count. Each ip is parsed and stored in its canonical text form. When
 // domain is non-empty, that suffix is stripped from each validated hostname
 // (see stripDomain); when stripAll is set, the hostname is then reduced to its
-// leftmost DNS label (see stripHostname).
-func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string) ([]Check, int) {
+// leftmost DNS label (see stripHostname). Each check's Type is resolved from
+// config — keyed by the unstripped hostname — before any stripping, defaulting
+// to defaultCheckType for absent hosts or empty types.
+func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, config map[string]HostConfig) ([]Check, int) {
 	var checks []Check
 	var failures int
 
@@ -194,13 +197,19 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string) ([]C
 		// Store the canonical text form so matching against `ip address`
 		// output is spelling-insensitive (e.g. FE80::1 => fe80::1).
 		ip = addr.String()
+		// Resolve the check type before stripping: config is keyed by the
+		// hostname as it appears on stdin.
+		ctype := defaultCheckType
+		if hc, ok := config[host]; ok && hc.Type != "" {
+			ctype = hc.Type
+		}
 		if domain != "" {
 			host = stripDomain(host, domain)
 		}
 		if stripAll {
 			host = stripHostname(host)
 		}
-		checks = append(checks, Check{Hostname: host, IP: ip})
+		checks = append(checks, Check{Hostname: host, IP: ip, Type: ctype})
 	}
 	if err := sc.Err(); err != nil {
 		alerter.Alert(Check{}, "error reading stdin", err)

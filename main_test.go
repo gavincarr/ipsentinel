@@ -35,12 +35,12 @@ func TestParseInput(t *testing.T) {
 	}, "\n")
 
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "")
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", nil)
 
 	wantChecks := []Check{
-		{"host1", "10.0.0.1"},
-		{"host2", "10.0.0.2"},
-		{"sub.host_alias-1.example.com", "10.0.0.7"},
+		{"host1", "10.0.0.1", "iproute2"},
+		{"host2", "10.0.0.2", "iproute2"},
+		{"sub.host_alias-1.example.com", "10.0.0.7", "iproute2"},
 	}
 	if len(checks) != len(wantChecks) {
 		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(wantChecks), checks)
@@ -64,7 +64,7 @@ func TestParseInput(t *testing.T) {
 
 func TestParseInputRejectsFlagSmuggling(t *testing.T) {
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false, "")
+	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false, "", nil)
 
 	if len(checks) != 0 {
 		t.Fatalf("flag-smuggling host was accepted as a check: %+v", checks)
@@ -98,8 +98,8 @@ func TestParseInputStrip(t *testing.T) {
 
 	// stripAll=true reduces each validated hostname to its leftmost label.
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "")
-	wantStripped := []Check{{"foo", "10.0.0.1"}, {"bar", "10.0.0.2"}}
+	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", nil)
+	wantStripped := []Check{{"foo", "10.0.0.1", "iproute2"}, {"bar", "10.0.0.2", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -114,7 +114,7 @@ func TestParseInputStrip(t *testing.T) {
 
 	// stripAll=false leaves the hostname untouched (existing behaviour).
 	var alerter2 captureAlerter
-	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "")
+	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", nil)
 	if checks[0].Hostname != "foo.example.com" {
 		t.Errorf("stripAll=false altered hostname: got %q, want %q", checks[0].Hostname, "foo.example.com")
 	}
@@ -143,8 +143,8 @@ func TestParseInputStripDomain(t *testing.T) {
 
 	// domain suffix is stripped only where it matches; other hosts pass through.
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com")
-	want := []Check{{"foo", "10.0.0.1"}, {"bar.other.com", "10.0.0.2"}, {"baz", "10.0.0.3"}}
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com", nil)
+	want := []Check{{"foo", "10.0.0.1", "iproute2"}, {"bar.other.com", "10.0.0.2", "iproute2"}, {"baz", "10.0.0.3", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -169,12 +169,12 @@ func TestParseInputValidatesIP(t *testing.T) {
 	}, "\n")
 
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "")
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", nil)
 
 	want := []Check{
-		{"host1", "10.0.0.1"},
-		{"host5", "fe80::1"},
-		{"host6", "fe80::1"},
+		{"host1", "10.0.0.1", "iproute2"},
+		{"host5", "fe80::1", "iproute2"},
+		{"host6", "fe80::1", "iproute2"},
 	}
 	if failures != 3 {
 		t.Errorf("got %d failures, want 3", failures)
@@ -219,6 +219,47 @@ func TestIPPresent(t *testing.T) {
 				t.Errorf("ipPresent(out, %q) = %v, want %v", tt.ip, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseInputConfigTypes(t *testing.T) {
+	input := "foo.example.com,10.0.0.1\nbar.example.com,10.0.0.2\n"
+	config := map[string]HostConfig{
+		"foo.example.com": {Type: "aws"}, // keyed by unstripped hostname
+	}
+
+	// The config lookup uses the hostname as read from stdin, even when
+	// stripping rewrites what is stored on the Check.
+	var alerter captureAlerter
+	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", config)
+	want := []Check{{"foo", "10.0.0.1", "aws"}, {"bar", "10.0.0.2", "iproute2"}}
+	if failures != 0 {
+		t.Fatalf("got %d failures, want 0", failures)
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(want), checks)
+	}
+	for i, w := range want {
+		if checks[i] != w {
+			t.Errorf("check[%d] = %+v, want %+v", i, checks[i], w)
+		}
+	}
+
+	// A nil config defaults every check to iproute2.
+	var alerter2 captureAlerter
+	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", nil)
+	for i, c := range checks {
+		if c.Type != "iproute2" {
+			t.Errorf("nil-config check[%d].Type = %q, want %q", i, c.Type, "iproute2")
+		}
+	}
+
+	// An entry with an empty Type also defaults to iproute2.
+	var alerter3 captureAlerter
+	checks, _ = parseInput(strings.NewReader(input), &alerter3, false, "",
+		map[string]HostConfig{"foo.example.com": {}})
+	if checks[0].Type != "iproute2" {
+		t.Errorf("empty-type check Type = %q, want %q", checks[0].Type, "iproute2")
 	}
 }
 
