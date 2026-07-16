@@ -60,7 +60,8 @@ Supported per-host keys:
 - `type`: the check type — `iproute2` (the default: run `ip address`
   and look for the expected ip) or `aws` (additionally query the EC2
   Instance Metadata Service for the instance's public IPv4, so both
-  private and public addresses can be verified).
+  private and public addresses can be verified; requires `curl` and a
+  POSIX login shell on the target host).
 
 Hosts absent from the config file (or with no `type`) use `iproute2`.
 Config entries for hosts not present on stdin are ignored, so one
