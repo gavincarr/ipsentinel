@@ -35,7 +35,7 @@ func TestParseInput(t *testing.T) {
 	}, "\n")
 
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false)
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "")
 
 	wantChecks := []Check{
 		{"host1", "10.0.0.1"},
@@ -64,7 +64,7 @@ func TestParseInput(t *testing.T) {
 
 func TestParseInputRejectsFlagSmuggling(t *testing.T) {
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false)
+	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false, "")
 
 	if len(checks) != 0 {
 		t.Fatalf("flag-smuggling host was accepted as a check: %+v", checks)
@@ -96,9 +96,9 @@ func TestStripHostname(t *testing.T) {
 func TestParseInputStrip(t *testing.T) {
 	input := "foo.example.com,10.0.0.1\nbar,10.0.0.2\n"
 
-	// strip=true reduces each validated hostname to its leftmost label.
+	// stripAll=true reduces each validated hostname to its leftmost label.
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, true)
+	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "")
 	wantStripped := []Check{{"foo", "10.0.0.1"}, {"bar", "10.0.0.2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
@@ -112,11 +112,49 @@ func TestParseInputStrip(t *testing.T) {
 		}
 	}
 
-	// strip=false leaves the hostname untouched (existing behaviour).
+	// stripAll=false leaves the hostname untouched (existing behaviour).
 	var alerter2 captureAlerter
-	checks, _ = parseInput(strings.NewReader(input), &alerter2, false)
+	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "")
 	if checks[0].Hostname != "foo.example.com" {
-		t.Errorf("strip=false altered hostname: got %q, want %q", checks[0].Hostname, "foo.example.com")
+		t.Errorf("stripAll=false altered hostname: got %q, want %q", checks[0].Hostname, "foo.example.com")
+	}
+}
+
+func TestStripDomain(t *testing.T) {
+	tests := []struct {
+		host, domain, want string
+	}{
+		{"foo.example.com", "example.com", "foo"},           // leading dot added
+		{"foo.example.com", ".example.com", "foo"},          // leading dot already present
+		{"a.b.example.com", "example.com", "a.b"},           // only the suffix is removed
+		{"foo.example.com", "other.com", "foo.example.com"}, // suffix absent: unchanged
+		{"example.com", "example.com", "example.com"},       // no leading label: unchanged
+		{"foo", "example.com", "foo"},                       // bare host: unchanged
+	}
+	for _, tt := range tests {
+		if got := stripDomain(tt.host, tt.domain); got != tt.want {
+			t.Errorf("stripDomain(%q, %q) = %q, want %q", tt.host, tt.domain, got, tt.want)
+		}
+	}
+}
+
+func TestParseInputStripDomain(t *testing.T) {
+	input := "foo.example.com,10.0.0.1\nbar.other.com,10.0.0.2\nbaz,10.0.0.3\n"
+
+	// domain suffix is stripped only where it matches; other hosts pass through.
+	var alerter captureAlerter
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com")
+	want := []Check{{"foo", "10.0.0.1"}, {"bar.other.com", "10.0.0.2"}, {"baz", "10.0.0.3"}}
+	if failures != 0 {
+		t.Fatalf("got %d failures, want 0", failures)
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(want), checks)
+	}
+	for i, w := range want {
+		if checks[i] != w {
+			t.Errorf("check[%d] = %+v, want %+v", i, checks[i], w)
+		}
 	}
 }
 

@@ -30,7 +30,8 @@ import (
 type CLI struct {
 	Concurrency int           `kong:"short='c',default='8',help='Number of ssh checks to run in parallel.'"`
 	Timeout     time.Duration `kong:"short='t',default='10s',help='Per-check ssh timeout.'"`
-	Strip       bool          `kong:"short='s',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
+	Strip       string        `kong:"short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
+	StripAll    bool          `kong:"short='S',name='strip-all',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
 	Verbose     bool          `kong:"short='v',help='Enable verbose (debug) logging.'"`
 }
 
@@ -47,11 +48,23 @@ type Check struct {
 var validHostname = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._-]*$`)
 
 // stripHostname returns the leftmost DNS label of host (foo.example.com => foo).
-// A host with no dot is returned unchanged. Used by the -s/--strip flag so
+// A host with no dot is returned unchanged. Used by the -S/--strip-all flag so
 // fully-qualified input names can drive ssh via short ~/.ssh/config aliases.
 func stripHostname(host string) string {
 	label, _, _ := strings.Cut(host, ".")
 	return label
+}
+
+// stripDomain removes the domain suffix from host (foo.example.com, example.com
+// => foo). A leading dot is added to domain when absent so the match is on a
+// label boundary. A host that does not carry the suffix is returned unchanged.
+// Used by the -s/--strip flag so fully-qualified input names can drive ssh via
+// short ~/.ssh/config aliases.
+func stripDomain(host, domain string) string {
+	if !strings.HasPrefix(domain, ".") {
+		domain = "." + domain
+	}
+	return strings.TrimSuffix(host, domain)
 }
 
 // Alerter posts alerts about failed checks. The MVP ships a LogAlerter; real
@@ -102,7 +115,7 @@ func main() {
 func run(cli CLI, log *slog.Logger, r io.Reader) int {
 	alerter := LogAlerter{log: log}
 
-	checks, parseFailures := parseInput(r, alerter, cli.Strip)
+	checks, parseFailures := parseInput(r, alerter, cli.StripAll, cli.Strip)
 	if parseFailures > 0 {
 		log.Warn("input had malformed lines", "count", parseFailures)
 	}
@@ -144,9 +157,10 @@ func run(cli CLI, log *slog.Logger, r io.Reader) int {
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
 // lines beginning with '#' are ignored. Malformed lines are alerted and
 // counted; it returns the valid checks plus the malformed-line count. When
-// strip is set, each validated hostname is reduced to its leftmost DNS label
-// before being stored (see stripHostname).
-func parseInput(r io.Reader, alerter Alerter, strip bool) ([]Check, int) {
+// domain is non-empty, that suffix is stripped from each validated hostname
+// (see stripDomain); when stripAll is set, the hostname is then reduced to its
+// leftmost DNS label (see stripHostname).
+func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string) ([]Check, int) {
 	var checks []Check
 	var failures int
 
@@ -169,7 +183,10 @@ func parseInput(r io.Reader, alerter Alerter, strip bool) ([]Check, int) {
 			failures++
 			continue
 		}
-		if strip {
+		if domain != "" {
+			host = stripDomain(host, domain)
+		}
+		if stripAll {
 			host = stripHostname(host)
 		}
 		checks = append(checks, Check{Hostname: host, IP: ip})
