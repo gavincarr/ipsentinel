@@ -93,6 +93,16 @@ func TestCheckCommands(t *testing.T) {
 			t.Errorf(`checkCommands["aws"] missing %q`, needle)
 		}
 	}
+	ifconfig := checkCommands["ifconfig"]
+	for _, needle := range []string{"ip address", "ifconfig.me"} {
+		if !strings.Contains(ifconfig, needle) {
+			t.Errorf(`checkCommands["ifconfig"] missing %q`, needle)
+		}
+	}
+	// curl's response body has no trailing newline; the echo supplies one.
+	if !strings.HasSuffix(ifconfig, "\necho") {
+		t.Errorf(`checkCommands["ifconfig"] should end with an echo: %q`, ifconfig)
+	}
 	if _, ok := checkCommands[defaultCheckType]; !ok {
 		t.Errorf("defaultCheckType %q is not a checkCommands key", defaultCheckType)
 	}

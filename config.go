@@ -29,12 +29,25 @@ const awsCommand = `ip address
 TOKEN=$(curl -sf -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token 2>/dev/null) || true
 curl -sf -m 2 ${TOKEN:+-H "X-aws-ec2-metadata-token: $TOKEN"} http://169.254.169.254/latest/meta-data/public-ipv4 || true`
 
+// ifconfigCommand is the non-AWS counterpart to awsCommand: it runs
+// `ip address` and appends the host's public IPv4 as seen by ifconfig.me.
+// Hosts behind a NAT gateway never have their public address configured on
+// an interface, so asking an external echo service is the only way to see
+// it. As with awsCommand, curl failure is tolerated (|| true) so the check
+// degrades to plain `ip address` matching, and -m 2 caps the request well
+// inside the overall ssh timeout. The trailing `echo` supplies the newline
+// curl's response body lacks.
+const ifconfigCommand = `ip address
+curl -sf -m 2 https://ifconfig.me || true
+echo`
+
 // checkCommands maps a check type to the remote command ssh runs on the
 // target host. It is the single source of truth for known types: config
 // validation checks `type` values against these keys.
 var checkCommands = map[string]string{
 	"iproute2": "ip address",
 	"aws":      awsCommand,
+	"ifconfig": ifconfigCommand,
 }
 
 // HostConfig holds the per-host settings from the -c/--config file.

@@ -53,15 +53,24 @@ output. Pass a YAML config file with `-c`/`--config`, keyed by hostname
     web1.example.com:
       type: aws
     web2.example.com:
+      type: ifconfig
+    web3.example.com:
       type: iproute2
 
 Supported per-host keys:
 
-- `type`: the check type — `iproute2` (the default: run `ip address`
-  and look for the expected ip) or `aws` (additionally query the EC2
-  Instance Metadata Service for the instance's public IPv4, so both
-  private and public addresses can be verified; requires `curl` and a
-  POSIX login shell on the target host).
+- `type`: the check type — one of:
+  - `iproute2` (the default): run `ip address` and look for the
+    expected ip.
+  - `aws`: additionally query the EC2 Instance Metadata Service for the
+    instance's public IPv4, so both private and public addresses can be
+    verified.
+  - `ifconfig`: the non-AWS equivalent — additionally query
+    `https://ifconfig.me` for the host's public IPv4 as seen from the
+    outside, for hosts behind a NAT gateway.
+
+  `aws` and `ifconfig` require `curl` and a POSIX login shell on the
+  target host.
 
 Hosts absent from the config file (or with no `type`) use `iproute2`.
 Config entries for hosts not present on stdin are ignored, so one
