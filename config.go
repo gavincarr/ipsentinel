@@ -37,22 +37,37 @@ curl -sf -m 2 ${TOKEN:+-H "X-aws-ec2-metadata-token: $TOKEN"} http://169.254.169
 // degrades to plain `ip address` matching, and -m 2 caps the request well
 // inside the overall ssh timeout. The trailing `echo` supplies the newline
 // curl's response body lacks.
-const ifconfigCommand = `ip address
-curl -sf -m 2 https://ifconfig.me || true
+//
+// ipVersion, when "4" or "6", forces curl's address family via -4/-6 (see
+// HostConfig.IPVersion): a dual-stack host defaults to whichever family curl
+// prefers, which may not be the one we're tracking. "" leaves curl's default.
+func ifconfigCommand(ipVersion string) string {
+	flag := ""
+	if ipVersion != "" {
+		flag = " -" + ipVersion
+	}
+	return `ip address
+curl -sf` + flag + ` -m 2 https://ifconfig.me || true
 echo`
+}
 
 // checkCommands maps a check type to the remote command ssh runs on the
 // target host. It is the single source of truth for known types: config
-// validation checks `type` values against these keys.
+// validation checks `type` values against these keys. The ifconfig entry is
+// the default (no forced IP version); sshArgs rebuilds it when a host sets
+// ip_version.
 var checkCommands = map[string]string{
 	"iproute2": "ip address",
 	"aws":      awsCommand,
-	"ifconfig": ifconfigCommand,
+	"ifconfig": ifconfigCommand(""),
 }
 
 // HostConfig holds the per-host settings from the -c/--config file.
 type HostConfig struct {
 	Type string `yaml:"type"`
+	// IPVersion forces the ifconfig check's curl to IPv4 ("4") or IPv6
+	// ("6"); "" lets curl choose. Only meaningful with type: ifconfig.
+	IPVersion string `yaml:"ip_version"`
 }
 
 // loadConfig reads the YAML config file at path: a map keyed by (unstripped)
@@ -74,6 +89,20 @@ func loadConfig(path string) (map[string]HostConfig, error) {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	for host, hc := range config {
+		if hc.IPVersion != "" {
+			if hc.IPVersion != "4" && hc.IPVersion != "6" {
+				return nil, fmt.Errorf(`%s: host %s: invalid ip_version %q (want "4" or "6")`,
+					path, host, hc.IPVersion)
+			}
+			if hc.Type != "ifconfig" {
+				t := hc.Type
+				if t == "" {
+					t = defaultCheckType + " (default)"
+				}
+				return nil, fmt.Errorf("%s: host %s: ip_version requires type ifconfig, got %s",
+					path, host, t)
+			}
+		}
 		if hc.Type == "" {
 			continue // defaults to defaultCheckType at lookup time
 		}

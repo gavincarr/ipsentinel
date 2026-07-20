@@ -56,6 +56,9 @@ output. Pass a YAML config file with `-c`/`--config`, keyed by hostname
       type: ifconfig
     web3.example.com:
       type: iproute2
+    web4.example.com:
+      type: ifconfig
+      ip_version: "6"
 
 Supported per-host keys:
 
@@ -71,6 +74,12 @@ Supported per-host keys:
 
   `aws` and `ifconfig` require `curl` and a POSIX login shell on the
   target host.
+
+- `ip_version`: `"4"` or `"6"` — forces the `ifconfig` check's `curl` to
+  that address family (via `curl -4`/`curl -6`). Use it on dual-stack
+  hosts where `ifconfig.me` would otherwise return the family you're not
+  tracking. Only valid with `type: ifconfig`; omit it to let `curl`
+  choose.
 
 Hosts absent from the config file (or with no `type`) use `iproute2`.
 Config entries for hosts not present on stdin are ignored, so one

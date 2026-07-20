@@ -24,6 +24,9 @@ web1.example.com:
 web2.example.com:
   type: iproute2
 web3.example.com:
+web4.example.com:
+  type: ifconfig
+  ip_version: "6"
 `)
 	config, err := loadConfig(path)
 	if err != nil {
@@ -33,6 +36,7 @@ web3.example.com:
 		"web1.example.com": {Type: "aws"},
 		"web2.example.com": {Type: "iproute2"},
 		"web3.example.com": {}, // null entry: empty type, defaults later
+		"web4.example.com": {Type: "ifconfig", IPVersion: "6"},
 	}
 	if len(config) != len(want) {
 		t.Fatalf("got %d entries, want %d: %+v", len(config), len(want), config)
@@ -63,6 +67,9 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"malformed yaml", "web1: [unclosed\n", "parsing"},
 		{"unknown type", "web1.example.com:\n  type: gcp\n", `unknown type "gcp"`},
 		{"unknown key", "web1.example.com:\n  tyep: aws\n", "tyep"},
+		{"invalid ip_version", "web1.example.com:\n  type: ifconfig\n  ip_version: \"5\"\n", `invalid ip_version "5"`},
+		{"ip_version wrong type", "web1.example.com:\n  type: aws\n  ip_version: \"4\"\n", "ip_version requires type ifconfig"},
+		{"ip_version default type", "web1.example.com:\n  ip_version: \"4\"\n", "ip_version requires type ifconfig"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

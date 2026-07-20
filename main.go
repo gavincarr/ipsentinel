@@ -39,9 +39,10 @@ type CLI struct {
 
 // Check is a single hostname,ip pair to verify.
 type Check struct {
-	Hostname string
-	IP       string
-	Type     string // check type: a checkCommands key, resolved by parseInput
+	Hostname  string
+	IP        string
+	Type      string // check type: a checkCommands key, resolved by parseInput
+	IPVersion string // "4"/"6" to force the ifconfig curl's family, else ""
 }
 
 // validHostname guards against argv flag smuggling: a hostname read from stdin
@@ -211,8 +212,12 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 		// Resolve the check type before stripping: config is keyed by the
 		// hostname as it appears on stdin.
 		ctype := defaultCheckType
-		if hc, ok := config[host]; ok && hc.Type != "" {
-			ctype = hc.Type
+		var ipVersion string
+		if hc, ok := config[host]; ok {
+			if hc.Type != "" {
+				ctype = hc.Type
+			}
+			ipVersion = hc.IPVersion
 		}
 		if domain != "" {
 			host = stripDomain(host, domain)
@@ -220,7 +225,7 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 		if stripAll {
 			host = stripHostname(host)
 		}
-		checks = append(checks, Check{Hostname: host, IP: ip, Type: ctype})
+		checks = append(checks, Check{Hostname: host, IP: ip, Type: ctype, IPVersion: ipVersion})
 	}
 	if err := sc.Err(); err != nil {
 		alerter.Alert(Check{}, "error reading stdin", err)
@@ -236,6 +241,11 @@ func sshArgs(c Check, connectTimeoutSeconds int) []string {
 	command, ok := checkCommands[c.Type]
 	if !ok {
 		command = checkCommands[defaultCheckType]
+	}
+	// ip_version only shapes the ifconfig curl; loadConfig rejects it for
+	// any other type, so this stays scoped to ifconfig.
+	if c.Type == "ifconfig" && c.IPVersion != "" {
+		command = ifconfigCommand(c.IPVersion)
 	}
 	return []string{
 		"-o", "BatchMode=yes",
