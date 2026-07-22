@@ -41,6 +41,26 @@ Or reduce every hostname to its leftmost label with `-S`/`--strip-all`
 list of options.
 
 
+Retries
+-------
+
+Not every ssh failure means a host has genuinely lost its IP. Transient
+failures — an early handshake abort (`kex_exchange_identification: Connection
+closed by remote host`), a connection reset, or a per-check timeout — are
+collected and retried before they alert. Hard failures — authentication
+(`Permission denied`), host-key mismatch, DNS resolution, or a wrong/missing
+IP — are definitive and alert immediately.
+
+Soft failures are retried up to `--retries` times (default 2) with
+exponential backoff: pass N waits `--retry-delay * 2^(N-1)` (default base
+`5s`, so 5s then 10s). A soft failure alerts only if it still fails after
+the last pass; one that recovers on a retry is a success. Set `--retries 0`
+to disable retries and alert every failure immediately.
+
+- `-r, --retries` — number of retry passes for transient failures (default 2).
+- `--retry-delay` — base backoff before the first retry pass (default 5s).
+
+
 Configuration file
 ------------------
 
