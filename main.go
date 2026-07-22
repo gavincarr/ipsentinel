@@ -32,6 +32,8 @@ type CLI struct {
 	Config      string        `kong:"short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
 	Concurrency int           `kong:"short='C',default='8',help='Number of ssh checks to run in parallel.'"`
 	Timeout     time.Duration `kong:"short='t',default='10s',help='Per-check ssh timeout.'"`
+	Retries     int           `kong:"short='r',default='2',help='Number of retry passes for transient (soft) ssh failures.'"`
+	RetryDelay  time.Duration `kong:"name='retry-delay',default='5s',help='Base backoff before the first retry pass; pass N waits delay*2^(N-1).'"`
 	Strip       string        `kong:"short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
 	StripAll    bool          `kong:"short='S',name='strip-all',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
 	Verbose     bool          `kong:"short='v',help='Enable verbose (debug) logging.'"`
@@ -110,6 +112,7 @@ func main() {
 	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level}))
 
 	cli.Concurrency = max(cli.Concurrency, 1)
+	cli.Retries = max(cli.Retries, 0)
 
 	var config map[string]HostConfig
 	if cli.Config != "" {
@@ -124,8 +127,8 @@ func main() {
 	os.Exit(run(cli, config, log, os.Stdin))
 }
 
-// run reads checks from r, runs them, and returns the process exit code
-// (0 = all passed, 1 = one or more failures).
+// run reads checks from r, runs them (with retries for transient failures),
+// and returns the process exit code (0 = all passed, 1 = one or more failures).
 func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) int {
 	alerter := LogAlerter{log: log}
 
@@ -135,37 +138,7 @@ func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) i
 	}
 	log.Debug("parsed input", "checks", len(checks))
 
-	var failures atomic.Int64
-	failures.Add(int64(parseFailures))
-
-	jobs := make(chan Check)
-	var wg sync.WaitGroup
-	for range cli.Concurrency {
-		wg.Go(func() {
-			for c := range jobs {
-				if err := runCheck(context.Background(), cli.Timeout, c); err != nil {
-					alerter.Alert(c, "check failed", err)
-					failures.Add(1)
-					continue
-				}
-				log.Debug("ok", "hostname", c.Hostname, "ip", c.IP)
-			}
-		})
-	}
-	for _, c := range checks {
-		jobs <- c
-	}
-	close(jobs)
-	wg.Wait()
-
-	n := failures.Load()
-	successes := len(checks) - (int(n) - parseFailures)
-	if n > 0 {
-		log.Info("finished with failures", "checks", len(checks), "successes", successes, "failures", n)
-		return 1
-	}
-	log.Info("all checks passed", "checks", len(checks), "successes", successes)
-	return 0
+	return runChecks(context.Background(), cli, checks, parseFailures, alerter, log, runCheck)
 }
 
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
@@ -282,6 +255,96 @@ func retryable(err error) bool {
 		}
 	}
 	return false
+}
+
+// softFail pairs a check with the retryable error from its most recent
+// attempt, so a survivor of the retry loop can be alerted with its last
+// real error.
+type softFail struct {
+	c   Check
+	err error
+}
+
+// checker runs a single check. runCheck is the production implementation;
+// tests substitute a fake so the retry loop can be exercised without ssh.
+type checker func(ctx context.Context, timeout time.Duration, c Check) error
+
+// runChecks runs the initial pass over checks, then up to cli.Retries further
+// passes over the checks that failed with a retryable error, sleeping
+// cli.RetryDelay*2^(N-1) before pass N (skipped when the delay is 0). Any soft
+// failure still failing after the last pass is alerted (reason "check failed
+// (after retries)") and counted. Returns the process exit code: 0 iff every
+// check ultimately passed. parseFailures pre-seeds the failure count and is
+// excluded from the success tally.
+func runChecks(ctx context.Context, cli CLI, checks []Check, parseFailures int,
+	alerter Alerter, log *slog.Logger, checkFn checker) int {
+	var failures atomic.Int64
+	failures.Add(int64(parseFailures))
+
+	soft := runPass(ctx, cli, checks, checkFn, alerter, log, &failures)
+	for attempt := 1; attempt <= cli.Retries && len(soft) > 0; attempt++ {
+		if delay := cli.RetryDelay * time.Duration(1<<(attempt-1)); delay > 0 {
+			time.Sleep(delay)
+		}
+		log.Info("retry pass", "attempt", attempt, "pending", len(soft))
+		retry := make([]Check, len(soft))
+		for i, sf := range soft {
+			retry[i] = sf.c
+		}
+		soft = runPass(ctx, cli, retry, checkFn, alerter, log, &failures)
+	}
+	for _, sf := range soft {
+		alerter.Alert(sf.c, "check failed (after retries)", sf.err)
+		failures.Add(1)
+	}
+
+	n := failures.Load()
+	successes := len(checks) - (int(n) - parseFailures)
+	if n > 0 {
+		log.Info("finished with failures", "checks", len(checks), "successes", successes, "failures", n)
+		return 1
+	}
+	log.Info("all checks passed", "checks", len(checks), "successes", successes)
+	return 0
+}
+
+// runPass runs every check in checks concurrently (bounded by cli.Concurrency).
+// A hard (non-retryable) failure is alerted and counted in failures at once;
+// a retryable failure is returned in the slice — not yet alerted or counted —
+// for the caller to retry. Successful checks are logged at debug.
+func runPass(ctx context.Context, cli CLI, checks []Check, checkFn checker,
+	alerter Alerter, log *slog.Logger, failures *atomic.Int64) []softFail {
+	var (
+		mu   sync.Mutex
+		soft []softFail
+	)
+	jobs := make(chan Check)
+	var wg sync.WaitGroup
+	for range cli.Concurrency {
+		wg.Go(func() {
+			for c := range jobs {
+				err := checkFn(ctx, cli.Timeout, c)
+				if err == nil {
+					log.Debug("ok", "hostname", c.Hostname, "ip", c.IP)
+					continue
+				}
+				if retryable(err) {
+					mu.Lock()
+					soft = append(soft, softFail{c, err})
+					mu.Unlock()
+					continue
+				}
+				alerter.Alert(c, "check failed", err)
+				failures.Add(1)
+			}
+		})
+	}
+	for _, c := range checks {
+		jobs <- c
+	}
+	close(jobs)
+	wg.Wait()
+	return soft
 }
 
 // runCheck runs the check's remote command via ssh (see checkCommands) and

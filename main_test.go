@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // captureAlerter records alerts for assertions in tests.
@@ -352,5 +358,105 @@ func TestRetryable(t *testing.T) {
 	}
 	if retryable(nil) {
 		t.Error("retryable(nil) = true, want false")
+	}
+}
+
+// fakeChecker returns scripted errors per hostname: the i-th call for a host
+// returns scripts[host][i] (nil once the script is exhausted => success). Safe
+// for concurrent use by runPass workers.
+type fakeChecker struct {
+	mu      sync.Mutex
+	scripts map[string][]error
+	calls   map[string]int
+}
+
+func newFakeChecker(scripts map[string][]error) *fakeChecker {
+	return &fakeChecker{scripts: scripts, calls: map[string]int{}}
+}
+
+func (f *fakeChecker) check(_ context.Context, _ time.Duration, c Check) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := f.calls[c.Hostname]
+	f.calls[c.Hostname]++
+	s := f.scripts[c.Hostname]
+	if i < len(s) {
+		return s[i]
+	}
+	return nil
+}
+
+func softErr() error { return fmt.Errorf("ssh timed out after 10s") }
+func hardErr() error { return fmt.Errorf("ssh failed: Permission denied (publickey).") }
+
+// testCLI returns a CLI with sleeping disabled so retry tests run instantly.
+func testCLI(retries int) CLI {
+	return CLI{Concurrency: 4, Timeout: time.Second, Retries: retries, RetryDelay: 0}
+}
+
+func TestRunPass(t *testing.T) {
+	checks := []Check{
+		{Hostname: "ok"},
+		{Hostname: "soft"},
+		{Hostname: "hard"},
+	}
+	fc := newFakeChecker(map[string][]error{
+		"soft": {softErr()},
+		"hard": {hardErr()},
+	})
+	var alerter captureAlerter
+	var failures atomic.Int64
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	soft := runPass(context.Background(), testCLI(2), checks, fc.check, &alerter, log, &failures)
+
+	if len(soft) != 1 || soft[0].c.Hostname != "soft" {
+		t.Fatalf("soft = %+v, want one entry for host \"soft\"", soft)
+	}
+	if got := failures.Load(); got != 1 {
+		t.Errorf("failures = %d, want 1 (hard only)", got)
+	}
+	if len(alerter.alerts) != 1 || alerter.alerts[0].reason != "check failed" {
+		t.Errorf("alerts = %+v, want one \"check failed\"", alerter.alerts)
+	}
+}
+
+func TestRetryLoop(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	tests := []struct {
+		name       string
+		retries    int
+		script     []error // for the single host "h"
+		wantCalls  int
+		wantAlerts int
+		wantReason string // reason of the (single) alert, if wantAlerts == 1
+		wantExit   int
+	}{
+		{"soft twice then recovers", 2, []error{softErr(), softErr()}, 3, 0, "", 0},
+		{"hard never retried", 2, []error{hardErr()}, 1, 1, "check failed", 1},
+		{"soft never recovers", 2, []error{softErr(), softErr(), softErr()}, 3, 1, "check failed (after retries)", 1},
+		{"retries zero", 0, []error{softErr()}, 1, 1, "check failed (after retries)", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fc := newFakeChecker(map[string][]error{"h": tt.script})
+			var alerter captureAlerter
+			exit := runChecks(context.Background(), testCLI(tt.retries),
+				[]Check{{Hostname: "h"}}, 0, &alerter, log, fc.check)
+
+			if fc.calls["h"] != tt.wantCalls {
+				t.Errorf("calls = %d, want %d", fc.calls["h"], tt.wantCalls)
+			}
+			if len(alerter.alerts) != tt.wantAlerts {
+				t.Fatalf("alerts = %d, want %d: %+v", len(alerter.alerts), tt.wantAlerts, alerter.alerts)
+			}
+			if tt.wantAlerts == 1 && alerter.alerts[0].reason != tt.wantReason {
+				t.Errorf("alert reason = %q, want %q", alerter.alerts[0].reason, tt.wantReason)
+			}
+			if exit != tt.wantExit {
+				t.Errorf("exit = %d, want %d", exit, tt.wantExit)
+			}
+		})
 	}
 }
