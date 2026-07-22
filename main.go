@@ -254,6 +254,36 @@ func sshArgs(c Check, connectTimeoutSeconds int) []string {
 	}
 }
 
+// softErrorPatterns are the known-transient ssh failure signatures. A check
+// error whose message contains any of these (case-insensitive) is retried;
+// every other failure — including unrecognised ones — is treated as hard and
+// alerted immediately. "connection closed by" is intentionally broader than
+// the "remote host" variant so it also catches ssh's "Connection closed by
+// <addr> port 22" form; both are transient handshake aborts.
+var softErrorPatterns = []string{
+	"ssh timed out after",         // our own context-deadline message
+	"kex_exchange_identification", // early key-exchange abort by the server
+	"connection closed by",
+	"connection reset by peer",
+	"connection timed out", // ssh's own network-level timeout
+}
+
+// retryable reports whether err is a known-transient ssh failure worth a
+// retry pass. Unknown errors return false (hard) by design; see
+// softErrorPatterns for the whitelist and the design doc for the rationale.
+func retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, p := range softErrorPatterns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // runCheck runs the check's remote command via ssh (see checkCommands) and
 // confirms the expected ip is present in the output. BatchMode avoids
 // password prompts so an unreachable or auth-failing host fails fast rather

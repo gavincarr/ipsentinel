@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -320,5 +321,36 @@ func TestSSHArgs(t *testing.T) {
 	got = sshArgs(c, 10)
 	if got[len(got)-1] != "ip address" {
 		t.Errorf("empty type remote command = %q, want %q", got[len(got)-1], "ip address")
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	soft := []string{
+		"ssh timed out after 10s",
+		"ssh failed: kex_exchange_identification: Connection closed by remote host",
+		"ssh failed: kex_exchange_identification: read: Connection reset by peer",
+		"ssh failed: Connection closed by 10.0.0.1 port 22", // case-insensitive match on "connection closed by"
+		"ssh failed: connect to host web1 port 22: Connection timed out",
+	}
+	hard := []string{
+		"ssh failed: Permission denied (publickey).",
+		"ssh failed: Host key verification failed.",
+		"ssh failed: ssh: Could not resolve hostname web1: Name or service not known",
+		"ssh failed: connect to host web1 port 22: No route to host",
+		"ssh failed: connect to host web1 port 22: Connection refused",
+		"ip 10.0.0.1 not found in `ip address` output",
+	}
+	for _, s := range soft {
+		if !retryable(fmt.Errorf("%s", s)) {
+			t.Errorf("retryable(%q) = false, want true (soft)", s)
+		}
+	}
+	for _, h := range hard {
+		if retryable(fmt.Errorf("%s", h)) {
+			t.Errorf("retryable(%q) = true, want false (hard)", h)
+		}
+	}
+	if retryable(nil) {
+		t.Error("retryable(nil) = true, want false")
 	}
 }
