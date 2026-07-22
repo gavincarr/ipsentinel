@@ -13,8 +13,10 @@ import (
 	"time"
 )
 
-// captureAlerter records alerts for assertions in tests.
+// captureAlerter records alerts for assertions in tests. The mutex guards
+// alerts because runPass calls Alert concurrently from its worker goroutines.
 type captureAlerter struct {
+	mu     sync.Mutex
 	alerts []struct {
 		check  Check
 		reason string
@@ -22,6 +24,8 @@ type captureAlerter struct {
 }
 
 func (a *captureAlerter) Alert(c Check, reason string, _ error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.alerts = append(a.alerts, struct {
 		check  Check
 		reason string

@@ -57,6 +57,10 @@ exponential backoff: pass N waits `--retry-delay * 2^(N-1)` (default base
 the last pass; one that recovers on a retry is a success. Set `--retries 0`
 to disable retries and alert every failure immediately.
 
+Note that the delay compounds: the worst-case added wall-clock for a run is
+`--retry-delay * (2^--retries - 1)` (15s at the defaults), so raising
+`--retries` well above the default lengthens a failing run substantially.
+
 - `-r, --retries` — number of retry passes for transient failures (default 2).
 - `--retry-delay` — base backoff before the first retry pass (default 5s).
 
