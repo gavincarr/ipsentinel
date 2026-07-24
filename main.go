@@ -36,7 +36,7 @@ type CLI struct {
 	RetryDelay  time.Duration `kong:"name='retry-delay',default='5s',help='Base backoff before the first retry pass; pass N waits delay*2^(N-1).'"`
 	Strip       string        `kong:"short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
 	StripAll    bool          `kong:"short='S',name='strip-all',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
-	Verbose     bool          `kong:"short='v',help='Enable verbose (debug) logging.'"`
+	Verbose     int           `kong:"short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
 }
 
 // Check is a single hostname,ip pair to verify.
@@ -105,8 +105,14 @@ func main() {
 		kong.ShortHelp(helpcolours.ShortHelp),
 	)
 
-	level := slog.LevelInfo
-	if cli.Verbose {
+	// Default to Warn so a clean run is silent and cron only mails on a real
+	// problem: alerts are Error, malformed input is Warn. -v adds the run
+	// summary (Info), -vv the per-check and per-pass detail (Debug).
+	level := slog.LevelWarn
+	switch {
+	case cli.Verbose == 1:
+		level = slog.LevelInfo
+	case cli.Verbose >= 2:
 		level = slog.LevelDebug
 	}
 	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level}))
@@ -136,7 +142,8 @@ func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) i
 	if parseFailures > 0 {
 		log.Warn("input had malformed lines", "count", parseFailures)
 	}
-	log.Debug("parsed input", "checks", len(checks))
+	// Info: with the closing summary, this is the pair -v exists to show.
+	log.Info("parsed input", "checks", len(checks))
 
 	return runChecks(context.Background(), cli, checks, parseFailures, alerter, log, runCheck)
 }
@@ -286,7 +293,7 @@ func runChecks(ctx context.Context, cli CLI, checks []Check, parseFailures int,
 		if delay := cli.RetryDelay * time.Duration(1<<(attempt-1)); delay > 0 {
 			time.Sleep(delay)
 		}
-		log.Info("retry pass", "attempt", attempt, "pending", len(soft))
+		log.Debug("retry pass", "attempt", attempt, "pending", len(soft))
 		retry := make([]Check, len(soft))
 		for i, sf := range soft {
 			retry[i] = sf.c
@@ -301,7 +308,9 @@ func runChecks(ctx context.Context, cli CLI, checks []Check, parseFailures int,
 	n := failures.Load()
 	successes := len(checks) - (int(n) - parseFailures)
 	if n > 0 {
-		log.Info("finished with failures", "checks", len(checks), "successes", successes, "failures", n)
+		// Warn, not Info: this summary must survive the default log level so a
+		// failing run says something even when -v is absent.
+		log.Warn("finished with failures", "checks", len(checks), "successes", successes, "failures", n)
 		return 1
 	}
 	log.Info("all checks passed", "checks", len(checks), "successes", successes)

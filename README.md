@@ -41,6 +41,28 @@ Or reduce every hostname to its leftmost label with `-S`/`--strip-all`
 list of options.
 
 
+Output
+------
+
+A clean run prints nothing and exits 0, so `ipsentinel` can be run from
+cron without a filter — you only hear from it when something is wrong.
+On stderr you get alerts for failed checks, a warning for malformed
+input lines, and a summary line when the run ends with failures; the
+exit code is 1 if any check failed.
+
+`-v`/`--verbose` is repeatable and raises the verbosity a level each
+time:
+
+- (none) — warnings and alerts only.
+- `-v` — adds the run summary: how many checks were parsed, and how
+  many passed at the end.
+- `-vv` — adds per-check detail: a line for every successful check and
+  for every retry pass.
+
+Note that a transient failure that recovers on a retry is a success,
+and so is reported only at `-vv`.
+
+
 Retries
 -------
 
