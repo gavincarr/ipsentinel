@@ -130,7 +130,15 @@ func main() {
 	default:
 		noColor = !term.IsTerminal(int(os.Stderr.Fd()))
 	}
-	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level, NoColor: noColor}))
+	// Drop the timestamp: these logs go to a terminal or to cron mail, both of
+	// which already carry their own timing, so the leading time just adds noise.
+	stripTime := func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			return slog.Attr{}
+		}
+		return a
+	}
+	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level, NoColor: noColor, ReplaceAttr: stripTime}))
 
 	cli.Concurrency = max(cli.Concurrency, 1)
 	cli.Retries = max(cli.Retries, 0)
