@@ -25,6 +25,7 @@ import (
 	helpcolours "github.com/gavincarr/kong-help-colours"
 	"github.com/joho/godotenv"
 	"github.com/lmittmann/tint"
+	"golang.org/x/term"
 )
 
 // CLI holds the command-line configuration.
@@ -115,7 +116,21 @@ func main() {
 	case cli.Verbose >= 2:
 		level = slog.LevelDebug
 	}
-	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level}))
+	// Colourise only when stderr is a terminal, with two env overrides:
+	// FORCE_COLOR forces colour on (e.g. piping to `less -R`), NO_COLOR
+	// (https://no-color.org) forces it off. FORCE_COLOR wins if both are set,
+	// as it's usually a deliberate per-command override. Without any of this
+	// tint emits ANSI codes unconditionally, polluting cron mail and redirects.
+	var noColor bool
+	switch {
+	case os.Getenv("FORCE_COLOR") != "":
+		noColor = false
+	case os.Getenv("NO_COLOR") != "":
+		noColor = true
+	default:
+		noColor = !term.IsTerminal(int(os.Stderr.Fd()))
+	}
+	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level, NoColor: noColor}))
 
 	cli.Concurrency = max(cli.Concurrency, 1)
 	cli.Retries = max(cli.Retries, 0)

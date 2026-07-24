@@ -62,6 +62,13 @@ time:
 Note that a transient failure that recovers on a retry is a success,
 and so is reported only at `-vv`.
 
+Log output is colourised only when stderr is a terminal, so cron mail
+and redirected output stay plain. Two environment variables override the
+detection: `NO_COLOR` (any value) forces colour off
+([no-color.org](https://no-color.org)), and `FORCE_COLOR` (any value)
+forces it on — useful when piping to a pager, e.g.
+`ipsentinel ... 2>&1 | less -R`. `FORCE_COLOR` wins if both are set.
+
 
 Retries
 -------
