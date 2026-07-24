@@ -294,13 +294,24 @@ func TestValidHostname(t *testing.T) {
 func TestSSHArgs(t *testing.T) {
 	c := Check{Hostname: "web1", IP: "10.0.0.1", Type: "iproute2"}
 	want := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "web1", "ip address"}
-	if got := sshArgs(c, 10); !slices.Equal(got, want) {
+	if got := sshArgs(c, 10, ""); !slices.Equal(got, want) {
 		t.Errorf("sshArgs(iproute2) = %q, want %q", got, want)
+	}
+
+	// A forced identity adds -i and IdentitiesOnly=yes before the -- separator,
+	// leaving the host and remote command last.
+	wantID := []string{
+		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+		"-i", "/root/.ssh/id_ipsentinel", "-o", "IdentitiesOnly=yes",
+		"--", "web1", "ip address",
+	}
+	if got := sshArgs(c, 10, "/root/.ssh/id_ipsentinel"); !slices.Equal(got, wantID) {
+		t.Errorf("sshArgs(identity) = %q, want %q", got, wantID)
 	}
 
 	// aws type: same argv shape, remote command is the IMDS snippet.
 	c.Type = "aws"
-	got := sshArgs(c, 10)
+	got := sshArgs(c, 10, "")
 	if len(got) != len(want) {
 		t.Fatalf("sshArgs(aws) has %d args, want %d: %q", len(got), len(want), got)
 	}
@@ -312,7 +323,7 @@ func TestSSHArgs(t *testing.T) {
 	// ifconfig type with a forced IP version injects curl's -4/-6 flag.
 	for _, v := range []string{"4", "6"} {
 		c = Check{Hostname: "web1", IP: "10.0.0.1", Type: "ifconfig", IPVersion: v}
-		remote = sshArgs(c, 10)[len(sshArgs(c, 10))-1]
+		remote = sshArgs(c, 10, "")[len(sshArgs(c, 10, ""))-1]
 		if !strings.Contains(remote, "curl -sf -"+v+" ") {
 			t.Errorf("ifconfig ip_version %q remote command missing curl -%s flag: %q", v, v, remote)
 		}
@@ -320,7 +331,7 @@ func TestSSHArgs(t *testing.T) {
 
 	// ifconfig without a version leaves curl's default (no -4/-6).
 	c = Check{Hostname: "web1", IP: "10.0.0.1", Type: "ifconfig"}
-	remote = sshArgs(c, 10)[len(sshArgs(c, 10))-1]
+	remote = sshArgs(c, 10, "")[len(sshArgs(c, 10, ""))-1]
 	if strings.Contains(remote, "curl -sf -4") || strings.Contains(remote, "curl -sf -6") {
 		t.Errorf("ifconfig without ip_version should not force a family: %q", remote)
 	}
@@ -328,7 +339,7 @@ func TestSSHArgs(t *testing.T) {
 	// Unknown or empty type falls back to the default command, so a
 	// zero-value Check still runs a sane check.
 	c.Type = ""
-	got = sshArgs(c, 10)
+	got = sshArgs(c, 10, "")
 	if got[len(got)-1] != "ip address" {
 		t.Errorf("empty type remote command = %q, want %q", got[len(got)-1], "ip address")
 	}

@@ -31,6 +31,7 @@ import (
 // CLI holds the command-line configuration.
 type CLI struct {
 	Config      string        `kong:"short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
+	Identity    string        `kong:"short='i',placeholder='PATH',help='SSH identity (private key) to use for every check. Also sets IdentitiesOnly=yes so only this key is offered — useful under cron, where no agent is present and the default keys need a passphrase.'"`
 	Concurrency int           `kong:"short='C',default='8',help='Number of ssh checks to run in parallel.'"`
 	Timeout     time.Duration `kong:"short='t',default='10s',help='Per-check ssh timeout.'"`
 	Retries     int           `kong:"short='r',default='2',help='Number of retry passes for transient (soft) ssh failures.'"`
@@ -168,7 +169,7 @@ func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) i
 	// Info: with the closing summary, this is the pair -v exists to show.
 	log.Info("parsed input", "checks", len(checks))
 
-	return runChecks(context.Background(), cli, checks, parseFailures, alerter, log, runCheck)
+	return runChecks(context.Background(), cli, checks, parseFailures, alerter, log, runCheckWith(cli.Identity))
 }
 
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
@@ -240,7 +241,7 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 // sshArgs builds the ssh argv for c: batch-mode options, the target host,
 // and the remote command for the check's type. Unknown or empty types fall
 // back to the default so a zero-value Check still runs a sane command.
-func sshArgs(c Check, connectTimeoutSeconds int) []string {
+func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
 	command, ok := checkCommands[c.Type]
 	if !ok {
 		command = checkCommands[defaultCheckType]
@@ -250,11 +251,18 @@ func sshArgs(c Check, connectTimeoutSeconds int) []string {
 	if c.Type == "ifconfig" && c.IPVersion != "" {
 		command = ifconfigCommand(c.IPVersion)
 	}
-	return []string{
+	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds),
-		"--", c.Hostname, command,
 	}
+	// A forced identity pins ssh to this one key. IdentitiesOnly=yes stops it
+	// from first offering agent/default keys, which under BatchMode can exhaust
+	// the server's auth attempts ("Too many authentication failures") before
+	// this key is ever tried.
+	if identityFile != "" {
+		args = append(args, "-i", identityFile, "-o", "IdentitiesOnly=yes")
+	}
+	return append(args, "--", c.Hostname, command)
 }
 
 // softErrorPatterns are the known-transient ssh failure signatures. A check
@@ -379,17 +387,25 @@ func runPass(ctx context.Context, cli CLI, checks []Check, checkFn checker,
 	return soft
 }
 
+// runCheckWith adapts runCheck to the checker signature, capturing the global
+// identityFile so it need not be threaded through every per-check call.
+func runCheckWith(identityFile string) checker {
+	return func(ctx context.Context, timeout time.Duration, c Check) error {
+		return runCheck(ctx, timeout, c, identityFile)
+	}
+}
+
 // runCheck runs the check's remote command via ssh (see checkCommands) and
 // confirms the expected ip is present in the output. BatchMode avoids
 // password prompts so an unreachable or auth-failing host fails fast rather
 // than hanging. ~/.ssh/config is honoured because we invoke the real ssh
-// binary.
-func runCheck(ctx context.Context, timeout time.Duration, c Check) error {
+// binary. identityFile, when non-empty, forces ssh to that key (see sshArgs).
+func runCheck(ctx context.Context, timeout time.Duration, c Check, identityFile string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	seconds := max(int(timeout.Seconds()), 1)
-	cmd := exec.CommandContext(ctx, "ssh", sshArgs(c, seconds)...)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgs(c, seconds, identityFile)...)
 
 	out, err := cmd.Output()
 	if err != nil {
