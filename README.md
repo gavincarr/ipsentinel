@@ -130,6 +130,8 @@ output. Pass a YAML config file with `-c`/`--config`, keyed by hostname
     web4.example.com:
       type: ifconfig
       ip_version: "6"
+    gitlab.example.com:
+      type: connect
 
 Supported per-host keys:
 
@@ -142,6 +144,10 @@ Supported per-host keys:
   - `ifconfig`: the non-AWS equivalent — additionally query
     `https://ifconfig.me` for the host's public IPv4 as seen from the
     outside, for hosts behind a NAT gateway.
+  - `connect`: for hosts reached through a port forward on another
+    machine, so the ip is on the forwarder, not the host (see
+    [Connect checks](#connect-checks)). ssh straight to the ip, and pass
+    if that succeeds; the `ip address` output is not checked.
 
   `aws` and `ifconfig` require `curl` and a POSIX login shell on the
   target host.
@@ -155,6 +161,51 @@ Supported per-host keys:
 Hosts absent from the config file (or with no `type`) use `iproute2`.
 Config entries for hosts not present on stdin are ignored, so one
 config file can cover a superset of any given input.
+
+### Connect checks
+
+Some hosts are reached through a port forward: the ip is configured on
+another machine (say a hypervisor) that DNATs a port on it to the host's
+private address. The ip then never appears in the host's `ip address`,
+and an external echo service sees its egress address instead, so neither
+`iproute2` nor `ifconfig` can check it.
+
+A `connect` check runs `ssh -o BatchMode=yes -o HostName=<ip> <host> ...`
+instead: the same ssh as the other types, but pointed at the expected ip
+itself. It passes if ssh succeeds. Since BatchMode refuses an unknown or
+changed host key, success proves the ip — via whatever forward sits in
+front of it — still reaches a machine holding the host's known host key.
+
+Only `HostName` is overridden: a command-line `-o` beats `~/.ssh/config`
+just for that option, so the port, user, identity and everything else
+still come from the host's `~/.ssh/config` entry. E.g. with
+`Host gitlab` / `Port 1027` there, a `gitlab,116.202.209.119` check
+connects to `116.202.209.119` port 1027.
+
+ipsentinel deliberately won't auto-accept host keys (that would defeat
+the check), so each connect host needs a one-off interactive setup to
+record its key under the new name, `[<ip>]:<port>` (or just `<ip>` on
+port 22). Until that's done — and again whenever a connect host's ip
+changes, or a new connect host is added — its check fails with `Host
+key verification failed`:
+
+1. Get the fingerprint of the host's known-good key, as already
+   recorded under its usual name:
+
+       ssh-keygen -l -F '[<host>]:<port>'    # or '<host>' on port 22
+
+2. Connect to the ip interactively:
+
+       ssh -o HostName=<ip> <host> true
+
+   ssh shows the key's fingerprint and asks whether to continue.
+   **Compare it against the fingerprint from step 1 before answering
+   `yes`**; if they differ, answer no — the ip is reaching some other
+   machine.
+
+The host key is then stored in `known_hosts` under two names, the host's
+usual one and the ip one, so if the host's key is ever rotated, update
+both entries.
 
 
 Authorized keys
@@ -184,7 +235,9 @@ comes from the `-c` config file:
 - otherwise, the config keys starting with the host plus a dot are
   candidates, so `web1` finds `web1.example.com`. If several match
   (`web1.example.com` and `web1.example.net`), they must all have the
-  same check type, or the host is skipped with an error naming them;
+  same check type (or at least the same forced command, as `iproute2`
+  and `connect` share), or the host is skipped with an error naming
+  them;
 - a host matching no key (or with no `-c` at all) uses the default,
   `iproute2`.
 
@@ -197,9 +250,11 @@ An invalid hostname is likewise skipped with an error. The exit code is
     db.example.com  from="192.0.2.10",restrict,command="ip address; TOKEN=..." ssh-ed25519 AAAA... root@monitor
 
 With **no HOST arguments**, there is one row per check variant instead,
-labelled `iproute2`, `aws`, `ifconfig`, `ifconfig-v4` and `ifconfig-v6`
-(the last two being `ifconfig` with `ip_version` 4 and 6) — handy for
-pasting by hand. `-c` is not used in this mode.
+labelled `iproute2`, `connect`, `aws`, `ifconfig`, `ifconfig-v4` and
+`ifconfig-v6` (the last two being `ifconfig` with `ip_version` 4 and 6)
+— handy for pasting by hand. `-c` is not used in this mode. The
+`connect` line is identical to the `iproute2` one, since both run
+`ip address`.
 
 `--from PATTERNS` adds an sshd `from=` restriction: a comma-separated
 list of the addresses, CIDRs or hostname patterns (with `!` negation)
@@ -207,6 +262,12 @@ the key may be used from — normally the monitoring host's address(es).
 Without it, a warning is logged on stderr, since the generated lines
 then accept the key from any address; the output is still produced and
 the exit code unaffected.
+
+Hosts behind a port forward that masquerades (SNATs) the connection —
+typically `connect` hosts — see it arrive from the forwarder's address,
+not the monitoring host's, so their `from=` must be that address.
+Generate their lines separately, e.g.
+`ipsentinel -c ipsentinel.yml authorized-keys --from <forwarder internal ip> ~/.ssh/id_ipsentinel.pub gitlab`.
 
 To deploy, pipe each line to its host over ssh's stdin (which needs no
 quoting, unlike embedding the line — which contains double quotes and

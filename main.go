@@ -1,7 +1,8 @@
 // Command ipsentinel reads hostname,ip pairs on stdin, runs
 // `ssh <hostname> ip address` for each (honouring ~/.ssh/config), and confirms
-// the ip is still present in that output. Any failure — ssh error, timeout, or
-// a missing ip — is posted to an Alerter for attention.
+// the ip is still present in that output (or, for connect checks, that ssh to
+// the ip itself succeeds with the host's key). Any failure — ssh error,
+// timeout, or a missing ip — is posted to an Alerter for attention.
 package main
 
 import (
@@ -57,7 +58,7 @@ type CheckCmd struct {
 // the hosts, if any, are positional arguments.
 type AuthorizedKeysCmd struct {
 	Pubkey string   `kong:"arg,name='pubkey',placeholder='PUBKEY',help='OpenSSH public key file to lock down (the .pub, not the private key).'"`
-	Hosts  []string `kong:"arg,optional,name='host',placeholder='HOST',help='Hosts to generate lines for, labelled exactly as given. Each is matched to a config entry by exact key, else by the keys starting with HOST followed by a dot (which must agree on the check type). With none, print one line per check variant instead.'"`
+	Hosts  []string `kong:"arg,optional,name='host',placeholder='HOST',help='Hosts to generate lines for, labelled exactly as given. Each is matched to a config entry by exact key, else by the keys starting with HOST followed by a dot (which must agree on the forced command). With none, print one line per check variant instead.'"`
 	From   string   `kong:"name='from',placeholder='PATTERNS',help='Comma-separated sshd from= patterns (IPs, CIDRs, hostname patterns, !negations) restricting where the key may be used from.'"`
 }
 
@@ -307,6 +308,16 @@ func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
 		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds),
 	}
+	// A connect check dials the expected IP itself rather than whatever the
+	// alias resolves to. A command-line -o overrides ~/.ssh/config only for
+	// the option given, so Port, User, IdentityFile etc. still come from the
+	// alias's config; and the host key is still verified (under BatchMode an
+	// unknown or changed key fails), which is what proves the IP still
+	// reaches this host. c.IP is safe in argv: parseInput validated and
+	// canonicalised it with netip, and IPv6 needs no brackets here.
+	if c.Type == "connect" {
+		args = append(args, "-o", "HostName="+c.IP)
+	}
 	// A forced identity pins ssh to this one key. IdentitiesOnly=yes stops it
 	// from first offering agent/default keys, which under BatchMode can exhaust
 	// the server's auth attempts ("Too many authentication failures") before
@@ -465,7 +476,7 @@ func runCheckWith(identityFile string) checker {
 }
 
 // runCheck runs the check's remote command via ssh (see checkCommands) and
-// confirms the expected ip is present in the output. BatchMode avoids
+// verifies the result (see verifyOutput). BatchMode avoids
 // password prompts so an unreachable or auth-failing host fails fast rather
 // than hanging. ~/.ssh/config is honoured because we invoke the real ssh
 // binary. identityFile, when non-empty, forces ssh to that key (see sshArgs).
@@ -488,7 +499,18 @@ func runCheck(ctx context.Context, timeout time.Duration, c Check, identityFile 
 		return fmt.Errorf("ssh failed: %w", err)
 	}
 
-	if !ipPresent(string(out), c.IP) {
+	return verifyOutput(c, string(out))
+}
+
+// verifyOutput checks the output of c's successful ssh run. A connect check
+// passes on the successful connection alone: its IP is a forwarded ingress
+// address that never appears on the target's interfaces, and the verified
+// host key is the proof. Every other type requires the expected ip in out.
+func verifyOutput(c Check, out string) error {
+	if c.Type == "connect" {
+		return nil
+	}
+	if !ipPresent(out, c.IP) {
 		return fmt.Errorf("ip %s not found in `ip address` output", c.IP)
 	}
 	return nil

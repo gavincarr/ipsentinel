@@ -27,16 +27,19 @@ web3.example.com:
 web4.example.com:
   type: ifconfig
   ip_version: "6"
+gitlab.example.com:
+  type: connect
 `)
 	config, err := loadConfig(path)
 	if err != nil {
 		t.Fatalf("loadConfig failed: %v", err)
 	}
 	want := map[string]HostConfig{
-		"web1.example.com": {Type: "aws"},
-		"web2.example.com": {Type: "iproute2"},
-		"web3.example.com": {}, // null entry: empty type, defaults later
-		"web4.example.com": {Type: "ifconfig", IPVersion: "6"},
+		"web1.example.com":   {Type: "aws"},
+		"web2.example.com":   {Type: "iproute2"},
+		"web3.example.com":   {}, // null entry: empty type, defaults later
+		"web4.example.com":   {Type: "ifconfig", IPVersion: "6"},
+		"gitlab.example.com": {Type: "connect"},
 	}
 	if len(config) != len(want) {
 		t.Fatalf("got %d entries, want %d: %+v", len(config), len(want), config)
@@ -70,6 +73,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"invalid ip_version", "web1.example.com:\n  type: ifconfig\n  ip_version: \"5\"\n", `invalid ip_version "5"`},
 		{"ip_version wrong type", "web1.example.com:\n  type: aws\n  ip_version: \"4\"\n", "ip_version requires type ifconfig"},
 		{"ip_version default type", "web1.example.com:\n  ip_version: \"4\"\n", "ip_version requires type ifconfig"},
+		{"ip_version connect type", "web1.example.com:\n  type: connect\n  ip_version: \"4\"\n", "ip_version requires type ifconfig, got connect"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -109,6 +113,11 @@ func TestCheckCommands(t *testing.T) {
 	// curl's response body has no trailing newline; the echo supplies one.
 	if !strings.HasSuffix(ifconfig, "\necho") {
 		t.Errorf(`checkCommands["ifconfig"] should end with an echo: %q`, ifconfig)
+	}
+	// connect deliberately shares iproute2's command, so its forced command
+	// in authorized_keys is identical too.
+	if cmd := checkCommands["connect"]; cmd != "ip address" {
+		t.Errorf(`checkCommands["connect"] = %q, want "ip address"`, cmd)
 	}
 	if _, ok := checkCommands[defaultCheckType]; !ok {
 		t.Errorf("defaultCheckType %q is not a checkCommands key", defaultCheckType)

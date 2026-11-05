@@ -169,7 +169,7 @@ type variant struct {
 // variantTypeOrder is the preferred display order of check types in variant
 // mode. Types in checkCommands but missing here still appear, sorted, after
 // these, so a new type can never be silently left out.
-var variantTypeOrder = []string{"iproute2", "aws", "ifconfig"}
+var variantTypeOrder = []string{"iproute2", "connect", "aws", "ifconfig"}
 
 // checkVariants returns every distinct check variant: each checkCommands
 // type, and for ifconfig one extra variant per ip_version (ifconfig-v4,

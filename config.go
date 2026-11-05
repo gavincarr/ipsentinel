@@ -56,10 +56,16 @@ echo`
 // validation checks `type` values against these keys. The ifconfig entry is
 // the default (no forced IP version); sshArgs rebuilds it when a host sets
 // ip_version.
+//
+// connect runs the same `ip address` as iproute2, but its output is not
+// checked: the check is the connection itself (sshArgs points ssh at the
+// expected IP, and success means the host key verified). The command is kept
+// identical to iproute2's so the authorized-keys forced command is too.
 var checkCommands = map[string]string{
 	"iproute2": "ip address",
 	"aws":      awsCommand,
 	"ifconfig": ifconfigCommand(""),
+	"connect":  "ip address",
 }
 
 // HostConfig holds the per-host settings from the -c/--config file.

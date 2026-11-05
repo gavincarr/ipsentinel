@@ -28,6 +28,7 @@ func TestForcedCommand(t *testing.T) {
 		want string
 	}{
 		{"iproute2", Check{Type: "iproute2"}, "ip address"},
+		{"connect", Check{Type: "connect"}, "ip address"},
 		{"empty type defaults", Check{}, "ip address"},
 		{"ifconfig", Check{Type: "ifconfig"},
 			"ip address; curl -sf -m 2 https://ifconfig.me || true; echo"},
@@ -80,6 +81,7 @@ func TestForcedCommandAWSQuoting(t *testing.T) {
 func TestForcedCommandShippedCommandsQuotable(t *testing.T) {
 	checks := []Check{
 		{Type: "iproute2"},
+		{Type: "connect"},
 		{Type: "aws"},
 		{Type: "ifconfig"},
 		{Type: "ifconfig", IPVersion: "4"},
@@ -233,18 +235,23 @@ func akLog(buf *bytes.Buffer) *slog.Logger {
 
 func TestResolveHost(t *testing.T) {
 	config := map[string]HostConfig{
-		"app":               {Type: "aws"},
-		"app.example.com":   {Type: "iproute2"},
-		"web1.example.com":  {Type: "aws"},
-		"facts.example.com": {Type: "ifconfig", IPVersion: "4"},
-		"db.example.com":    {Type: "aws"},
-		"db.example.net":    {Type: "aws"},
-		"mx.example.com":    {Type: "aws"},
-		"mx.example.net":    {Type: "iproute2"},
-		"ifc.example.com":   {Type: "ifconfig"},
-		"ifc.example.net":   {Type: "ifconfig", IPVersion: "6"},
-		"dflt.example.com":  {},
-		"dflt.example.net":  {Type: "iproute2"}, // same as the default
+		"app":                {Type: "aws"},
+		"app.example.com":    {Type: "iproute2"},
+		"web1.example.com":   {Type: "aws"},
+		"facts.example.com":  {Type: "ifconfig", IPVersion: "4"},
+		"db.example.com":     {Type: "aws"},
+		"db.example.net":     {Type: "aws"},
+		"mx.example.com":     {Type: "aws"},
+		"mx.example.net":     {Type: "iproute2"},
+		"ifc.example.com":    {Type: "ifconfig"},
+		"ifc.example.net":    {Type: "ifconfig", IPVersion: "6"},
+		"dflt.example.com":   {},
+		"dflt.example.net":   {Type: "iproute2"}, // same as the default
+		"gitlab.example.com": {Type: "connect"},
+		"git.example.com":    {Type: "connect"},
+		"git.example.net":    {Type: "iproute2"}, // same command as connect
+		"gw.example.com":     {Type: "connect"},
+		"gw.example.net":     {Type: "aws"},
 	}
 	tests := []struct {
 		host    string
@@ -260,6 +267,10 @@ func TestResolveHost(t *testing.T) {
 		{"nothere", Check{Hostname: "nothere", Type: "iproute2"}, nil},
 		{"db", Check{Hostname: "db", Type: "aws"}, nil},
 		{"dflt", Check{Hostname: "dflt", Type: "iproute2"}, nil},
+		{"gitlab", Check{Hostname: "gitlab", Type: "connect"}, nil},
+		{"gitlab.example.com", Check{Hostname: "gitlab.example.com", Type: "connect"}, nil},
+		{"git", Check{Hostname: "git", Type: "connect"}, nil}, // connect and iproute2 share a command
+		{"gw", Check{}, []string{"gw.example.com (connect)", "gw.example.net (aws)"}},
 		{"mx", Check{}, []string{"mx.example.com (aws)", "mx.example.net (iproute2)"}},
 		{"ifc", Check{}, []string{"ifc.example.com (ifconfig)", "ifc.example.net (ifconfig (ip_version 6))"}},
 	}
@@ -297,12 +308,13 @@ func TestRunAuthorizedKeysHosts(t *testing.T) {
 		return `from="192.0.2.10",restrict,command="` + forced + `" ` + testPubkey
 	}
 	config := map[string]HostConfig{
-		"web1.example.com":  {Type: "aws"},
-		"facts.example.com": {Type: "ifconfig", IPVersion: "4"},
-		"db.example.com":    {Type: "aws"},
-		"db.example.net":    {Type: "aws"},
-		"mx.example.com":    {Type: "aws"},
-		"mx.example.net":    {Type: "iproute2"},
+		"web1.example.com":   {Type: "aws"},
+		"facts.example.com":  {Type: "ifconfig", IPVersion: "4"},
+		"db.example.com":     {Type: "aws"},
+		"db.example.net":     {Type: "aws"},
+		"mx.example.com":     {Type: "aws"},
+		"mx.example.net":     {Type: "iproute2"},
+		"gitlab.example.com": {Type: "connect"},
 	}
 
 	tests := []struct {
@@ -320,6 +332,12 @@ func TestRunAuthorizedKeysHosts(t *testing.T) {
 				"other              " + line("ip address") + "\n" +
 				"facts.example.com  " + line(ifconfig4) + "\n",
 			wantExit: 0,
+		},
+		{
+			name:       "connect host gets the ip address forced command",
+			hosts:      []string{"gitlab", "web1"},
+			wantStdout: "gitlab  " + line("ip address") + "\n" + "web1    " + line(aws) + "\n",
+			wantExit:   0,
 		},
 		{
 			name:       "ambiguous with one check type is fine",
@@ -389,9 +407,9 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 		t.Errorf("unexpected stderr:\n%s", stderr.String())
 	}
 
-	wantLabels := []string{"iproute2", "aws", "ifconfig", "ifconfig-v4", "ifconfig-v6"}
+	wantLabels := []string{"iproute2", "connect", "aws", "ifconfig", "ifconfig-v4", "ifconfig-v6"}
 	wantChecks := []Check{
-		{Type: "iproute2"}, {Type: "aws"}, {Type: "ifconfig"},
+		{Type: "iproute2"}, {Type: "connect"}, {Type: "aws"}, {Type: "ifconfig"},
 		{Type: "ifconfig", IPVersion: "4"}, {Type: "ifconfig", IPVersion: "6"},
 	}
 	rows := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
@@ -414,21 +432,16 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 }
 
 // TestCheckVariantsCoverCheckCommands guards against a new check type being
-// silently left out of variant mode, and against two variants colliding.
+// silently left out of variant mode, and against two variants sharing a
+// label. Forced commands may repeat: connect deliberately shares iproute2's.
 func TestCheckVariantsCoverCheckCommands(t *testing.T) {
 	vs := checkVariants()
 	labels := make(map[string]bool)
-	forced := make(map[string]string)
 	for _, v := range vs {
 		labels[v.label] = true
-		f, err := forcedCommand(v.check)
-		if err != nil {
+		if _, err := forcedCommand(v.check); err != nil {
 			t.Fatalf("%s: %v", v.label, err)
 		}
-		if prev, dup := forced[f]; dup {
-			t.Errorf("variants %s and %s have the same forced command", prev, v.label)
-		}
-		forced[f] = v.label
 	}
 	for typ := range checkCommands {
 		if !labels[typ] {

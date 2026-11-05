@@ -345,6 +345,86 @@ func TestSSHArgs(t *testing.T) {
 	}
 }
 
+func TestSSHArgsConnect(t *testing.T) {
+	c := Check{Hostname: "gitlab", IP: "116.202.209.119", Type: "connect"}
+	want := []string{
+		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+		"-o", "HostName=116.202.209.119",
+		"--", "gitlab", "ip address",
+	}
+	if got := sshArgs(c, 10, ""); !slices.Equal(got, want) {
+		t.Errorf("sshArgs(connect) = %q, want %q", got, want)
+	}
+
+	wantID := []string{
+		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+		"-o", "HostName=116.202.209.119",
+		"-i", "/root/.ssh/id_ipsentinel", "-o", "IdentitiesOnly=yes",
+		"--", "gitlab", "ip address",
+	}
+	if got := sshArgs(c, 10, "/root/.ssh/id_ipsentinel"); !slices.Equal(got, wantID) {
+		t.Errorf("sshArgs(connect, identity) = %q, want %q", got, wantID)
+	}
+
+	// IPv6 is passed bare: ssh's HostName takes an unbracketed address.
+	c.IP = "2001:db8::1"
+	got := sshArgs(c, 10, "")
+	if i := slices.Index(got, "HostName=2001:db8::1"); i < 1 || got[i-1] != "-o" || i > slices.Index(got, "--") {
+		t.Errorf("sshArgs(connect, ipv6) missing -o HostName=2001:db8::1 before --: %q", got)
+	}
+
+	// No other type overrides HostName.
+	for _, typ := range []string{"iproute2", "aws", "ifconfig", ""} {
+		c := Check{Hostname: "web1", IP: "10.0.0.1", Type: typ}
+		for _, a := range sshArgs(c, 10, "") {
+			if strings.HasPrefix(a, "HostName=") {
+				t.Errorf("sshArgs(%q) unexpectedly sets %s", typ, a)
+			}
+		}
+	}
+}
+
+func TestVerifyOutput(t *testing.T) {
+	const out = `2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 10.20.0.5/24 brd 10.20.0.255 scope global eth0`
+	tests := []struct {
+		name    string
+		c       Check
+		out     string
+		wantErr bool
+	}{
+		{"connect passes without the ip in output", Check{IP: "116.202.209.119", Type: "connect"}, out, false},
+		{"connect passes on empty output", Check{IP: "116.202.209.119", Type: "connect"}, "", false},
+		{"iproute2 fails without the ip", Check{IP: "116.202.209.119", Type: "iproute2"}, out, true},
+		{"iproute2 passes with the ip", Check{IP: "10.20.0.5", Type: "iproute2"}, out, false},
+		{"aws fails without the ip", Check{IP: "116.202.209.119", Type: "aws"}, out, true},
+		{"ifconfig fails without the ip", Check{IP: "116.202.209.119", Type: "ifconfig"}, out, true},
+		{"default type fails without the ip", Check{IP: "116.202.209.119"}, out, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyOutput(tt.c, tt.out)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("verifyOutput(%+v) = %v, wantErr %v", tt.c, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRetryableHostKeyFailure pins that an unknown or changed host key — how
+// a connect check fails when its IP no longer reaches the host, or before
+// the one-off key acceptance — is a hard failure, alerted at once.
+func TestRetryableHostKeyFailure(t *testing.T) {
+	for _, s := range []string{
+		"ssh failed: Host key verification failed.",
+		"ssh failed: No ED25519 host key is known for [116.202.209.119]:1027 and you have requested strict checking.\nHost key verification failed.",
+	} {
+		if retryable(fmt.Errorf("%s", s)) {
+			t.Errorf("retryable(%q) = true, want false (hard)", s)
+		}
+	}
+}
+
 func TestRetryable(t *testing.T) {
 	soft := []string{
 		"ssh timed out after 10s",
