@@ -73,7 +73,7 @@ func TestConfigDefaults(t *testing.T) {
 		wantCheck      string
 	}{
 		{"empty entry", connectSSHConfig, HostConfig{}, "ssh_config", "iproute2"},
-		{"empty default means ssh_config", "", HostConfig{}, "ssh_config", "iproute2"},
+		{"empty default means ip", "", HostConfig{}, "ip", "iproute2"},
 		{"entry without connect takes default ip", connectIP, HostConfig{Check: "aws"}, "ip", "aws"},
 		{"absent host takes default ip", connectIP, HostConfig{}, "ip", "iproute2"},
 		{"explicit ssh_config beats default ip", connectIP, HostConfig{Connect: "ssh_config"}, "ssh_config", "iproute2"},
@@ -145,8 +145,6 @@ func TestLoadConfigCheckNoneNeedsConnectIP(t *testing.T) {
 			"connect: ssh_config"},
 		{"defaulted", "h.example.com:\n  check: none\n", connectSSHConfig,
 			"connect unset, so --connect-default=ssh_config applies"},
-		{"defaulted, empty default", "h.example.com:\n  check: none\n", "",
-			"connect unset, so --connect-default=ssh_config applies"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -162,6 +160,10 @@ func TestLoadConfigCheckNoneNeedsConnectIP(t *testing.T) {
 	// With --connect-default=ip, the same defaulted entry is valid.
 	if _, err := loadConfig(writeConfig(t, "h.example.com:\n  check: none\n"), connectIP); err != nil {
 		t.Errorf("check: none with --connect-default=ip: %v", err)
+	}
+	// So is it with an empty default, which falls back to defaultConnect (ip).
+	if _, err := loadConfig(writeConfig(t, "h.example.com:\n  check: none\n"), ""); err != nil {
+		t.Errorf("check: none with empty --connect-default: %v", err)
 	}
 }
 

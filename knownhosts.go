@@ -302,7 +302,7 @@ func runKnownHosts(r io.Reader, stripAll bool, domain string, config Config, log
 	if ipHosts == 0 {
 		// Exit 0 with no output looks like "everything is recorded", which
 		// is wrong when the input was never considered at all.
-		log.Warn("no connect: ip hosts in input; nothing to do (did you mean --connect-default ip?)")
+		log.Warn("no connect: ip hosts in input; nothing to do (do they all set connect: ssh_config?)")
 	}
 	if problems > 0 {
 		log.Warn("finished with problems", "lines", lines, "problems", problems)

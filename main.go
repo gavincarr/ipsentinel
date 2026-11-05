@@ -1,8 +1,9 @@
 // Command ipsentinel reads hostname,ip pairs on stdin, runs
-// `ssh <hostname> ip address` for each (honouring ~/.ssh/config), and confirms
-// the ip is still present in that output. Per-host config can change how ssh
-// reaches the host (connect: ssh_config, or ip to dial the expected ip itself
-// so the verified host key proves it reaches the host) and what is checked
+// `ssh -o HostName=<ip> <hostname> ip address` for each (honouring
+// ~/.ssh/config for everything but the address), and confirms the ip is still
+// present in that output. Per-host config can change how ssh reaches the host
+// (connect: ip, the default, dials the expected ip itself so the verified host
+// key proves it reaches the host; ssh_config sshes to the name) and what is checked
 // (check: iproute2, aws, ifconfig, or none to pass on ssh success alone, with
 // connect: ip). Any failure — ssh error, timeout, or a missing ip — is posted
 // to an Alerter for attention.
@@ -36,7 +37,7 @@ import (
 // every command; the per-command settings live on the command structs.
 type CLI struct {
 	Config         string `kong:"name='config',short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
-	ConnectDefault string `kong:"name='connect-default',enum='ip,ssh_config',default='ssh_config',help='Connect mode for hosts that do not set connect in the config file (including hosts with no entry): ssh_config or ip. Mainly for trying connect: ip across all hosts before changing anything per host.'"`
+	ConnectDefault string `kong:"name='connect-default',enum='ip,ssh_config',default='ip',help='Connect mode for hosts that do not set connect in the config file (including hosts with no entry): ip (ssh to the expected ip itself) or ssh_config (ssh to the hostname as resolved via ~/.ssh/config and DNS).'"`
 	Verbose        int    `kong:"name='verbose',short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
 
 	// check is the default command, and "withargs" lets its flags be given

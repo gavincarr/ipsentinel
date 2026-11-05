@@ -3,9 +3,10 @@ Overview
 --------
 
 `ipsentinel` is a system that takes a set of `hostname,ip` pairs on
-stdin and does an `ssh hostname ip address` on each one (supporting
-`~/.ssh/config`), and then confirms that the ip is (still) present
-in that output. On any error (eg ssh errors OR if ip is not found)
+stdin and does an `ssh -o HostName=ip hostname ip address` on each
+one (dialling the expected ip itself, with everything else from the
+hostname's `~/.ssh/config` entry), and then confirms that the ip is
+(still) present in that output. On any error (eg ssh errors OR if ip is not found)
 it reports an error.
 
 
@@ -120,8 +121,9 @@ Note that the delay compounds: the worst-case added wall-clock for a run is
 Configuration file
 ------------------
 
-By default every host is checked the same way: ssh to the hostname and
-look for the expected ip in `ip address`. Some hosts need something
+By default every host is checked the same way: ssh to the expected ip
+(as the hostname's `~/.ssh/config` entry otherwise says) and look for
+the expected ip in `ip address`. Some hosts need something
 else — most notably AWS EC2 instances, whose public IP is a 1:1 NAT
 mapping held in AWS infrastructure rather than configured on the
 instance, so it never appears in `ip address` output. Pass a YAML config
@@ -133,7 +135,7 @@ file with `-c`/`--config`, keyed by hostname *as it appears on stdin*
     web2.example.com:
       check: ifconfig
     web3.example.com:
-      connect: ip           # check defaults to iproute2
+      connect: ssh_config   # ssh to the name; check defaults to iproute2
     gitlab.example.com:
       connect: ip
       check: none
@@ -143,13 +145,13 @@ the host, and **`check`**, what counts as a pass.
 
 ### `connect`
 
-- `ssh_config` (the default): ssh to the hostname, resolved as usual via
+- `ip` (the default): ssh straight to the expected ip with
+  `-o HostName=<ip>`. A pass proves traffic to the ip reaches the box
+  holding the host's key. See [`connect: ip`](#connect-ip) below.
+- `ssh_config`: ssh to the hostname, resolved as usual via
   `~/.ssh/config` and DNS. A pass proves the expected ip is configured
   on (or, for `aws`/`ifconfig`, belongs to) the box holding the host's
   key.
-- `ip`: ssh straight to the expected ip with `-o HostName=<ip>`. A pass
-  proves traffic to the ip reaches the box holding the host's key. See
-  [`connect: ip`](#connect-ip) below.
 
 ### `check`
 
@@ -187,13 +189,19 @@ doesn't suit hosts behind a port forward (use `check: none` for those).
 
 Hosts absent from the config file, or with no `check`, use `iproute2`.
 Hosts absent from the config file, or with no `connect`, use the
-`--connect-default` mode, which is `ssh_config` unless you say
-otherwise. `--connect-default=ip` is mainly for trying `connect: ip`
-across all hosts at once before changing anything per host; an explicit
-`connect` in an entry always wins over it. Because it changes which
-entries are valid (`check: none` with no `connect` is fine under
-`--connect-default=ip`, rejected otherwise), it's a shared flag, so
-`check` and `authorized-keys` validate a config identically.
+`--connect-default` mode, which is `ip` unless you say otherwise.
+`--connect-default=ssh_config` switches every such host to ssh'ing to
+its name instead; an explicit `connect` in an entry always wins over
+it. Because it changes which entries are valid (`check: none` with no
+`connect` is fine under the `ip` default, rejected under
+`--connect-default=ssh_config`), it's a shared flag, so all commands
+validate a config identically.
+
+Before `ip` became the default, `ssh_config` was. Upgrading from that,
+run `ipsentinel known-hosts` first (see [Known hosts](#known-hosts)):
+until each host's key is recorded under its ip name, its check fails
+with `Host key verification failed`. To keep the old behaviour, pass
+`--connect-default=ssh_config`.
 
 Config entries for hosts not present on stdin are ignored, so one config
 file can cover a superset of any given input.
@@ -253,7 +261,7 @@ ipsentinel deliberately won't auto-accept host keys (that would defeat
 the check), so each `connect: ip` host needs a one-off setup to record
 its key under the new name, `[<ip>]:<port>` (or just `<ip>` on port 22).
 Until that's done — and again whenever such a host's ip changes, or a
-new one is added (including via `--connect-default=ip`) — its check
+new one is added — its check
 fails with `Host key verification failed`.
 
 `ipsentinel known-hosts` is the first-line fix: it prints the lines to
@@ -303,10 +311,10 @@ hosts are considered. Output on stdout is `known_hosts` lines only;
 messages go to stderr. Review the lines, then append them:
 
     $ tinydnsip -d example.com data |
-        ipsentinel known-hosts -c ipsentinel.yml -s example.com --connect-default ip
+        ipsentinel known-hosts -c ipsentinel.yml -s example.com
     [192.0.2.10]:2222 ssh-ed25519 AAAA...
     $ tinydnsip -d example.com data |
-        ipsentinel known-hosts -c ipsentinel.yml -s example.com --connect-default ip >> ~/.ssh/known_hosts
+        ipsentinel known-hosts -c ipsentinel.yml -s example.com >> ~/.ssh/known_hosts
 
 Things to know:
 
@@ -326,8 +334,8 @@ Things to know:
   side's first user file: the printed lines belong there, so
   `>> ~/.ssh/known_hosts` may be wrong.
 - **No `connect: ip` hosts** in the input prints nothing and exits 0,
-  with the warning `no connect: ip hosts in input; nothing to do (did you
-  mean --connect-default ip?)`.
+  with the warning `no connect: ip hosts in input; nothing to do (do they
+  all set connect: ssh_config?)`.
 - **The exit code is 1 if any host has a problem, or an input line is
   malformed**, and nothing is printed for a problem host. Each problem is
   logged:

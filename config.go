@@ -35,9 +35,9 @@ const checkNone = "none"
 
 // Defaults for hosts with no config entry, or an entry without the key.
 // defaultConnect is only the fallback for an empty Config.ConnectDefault:
-// --connect-default (whose own default is ssh_config) normally supplies it.
+// --connect-default (whose own default is ip) normally supplies it.
 const (
-	defaultConnect = connectSSHConfig
+	defaultConnect = connectIP
 	defaultCheck   = "iproute2"
 )
 

@@ -256,7 +256,7 @@ func TestRunKnownHosts(t *testing.T) {
 		{name: "no connect: ip hosts warns", input: in1,
 			known:   "web1 " + keyA + "\n",
 			config:  Config{ConnectDefault: connectSSHConfig},
-			wantLog: []string{"level=WARN", "no connect: ip hosts in input; nothing to do (did you mean --connect-default ip?)"}},
+			wantLog: []string{"level=WARN", "no connect: ip hosts in input; nothing to do (do they all set connect: ssh_config?)"}},
 		{name: "ssh -G failure on ip side", input: in1,
 			known:    "web1 " + keyA + "\n",
 			ssh:      fakeSSH{err: errors.New("boom")},

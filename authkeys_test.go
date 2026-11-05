@@ -256,16 +256,16 @@ func TestResolveHost(t *testing.T) {
 		want    Check
 		errWant []string // substrings; nil means success
 	}{
-		{"web1.example.com", ck("web1.example.com", "ssh_config", "aws"), nil},
-		{"app", ck("app", "ssh_config", "aws"), nil}, // exact match beats prefix
-		{"web1", ck("web1", "ssh_config", "aws"), nil},
-		{"web1.example", ck("web1.example", "ssh_config", "aws"), nil},
-		{"facts", ck("facts", "ssh_config", "ifconfig"), nil},
-		{"ifc", ck("ifc", "ssh_config", "ifconfig"), nil},
-		{"web", ck("web", "ssh_config", "iproute2"), nil}, // prefix must end on a label
-		{"nothere", ck("nothere", "ssh_config", "iproute2"), nil},
-		{"db", ck("db", "ssh_config", "aws"), nil},
-		{"dflt", ck("dflt", "ssh_config", "iproute2"), nil},
+		{"web1.example.com", ck("web1.example.com", defaultConnect, "aws"), nil},
+		{"app", ck("app", defaultConnect, "aws"), nil}, // exact match beats prefix
+		{"web1", ck("web1", defaultConnect, "aws"), nil},
+		{"web1.example", ck("web1.example", defaultConnect, "aws"), nil},
+		{"facts", ck("facts", defaultConnect, "ifconfig"), nil},
+		{"ifc", ck("ifc", defaultConnect, "ifconfig"), nil},
+		{"web", ck("web", defaultConnect, "iproute2"), nil}, // prefix must end on a label
+		{"nothere", ck("nothere", defaultConnect, "iproute2"), nil},
+		{"db", ck("db", defaultConnect, "aws"), nil},
+		{"dflt", ck("dflt", defaultConnect, "iproute2"), nil},
 		{"gitlab", ck("gitlab", "ip", "none"), nil},
 		{"gitlab.example.com", ck("gitlab.example.com", "ip", "none"), nil},
 		{"git", ck("git", "ip", "iproute2"), nil}, // connect doesn't change the forced command
@@ -543,7 +543,7 @@ func TestCLIGrammar(t *testing.T) {
 		akHostsCmd = "authorized-keys <pubkey> <host>"
 		khCmd      = "known-hosts"
 	)
-	defaults := CLI{ConnectDefault: "ssh_config", Check: CheckCmd{Concurrency: 8, Timeout: 10 * time.Second, Retries: 2, RetryDelay: 5 * time.Second}}
+	defaults := CLI{ConnectDefault: defaultConnect, Check: CheckCmd{Concurrency: 8, Timeout: 10 * time.Second, Retries: 2, RetryDelay: 5 * time.Second}}
 	with := func(f func(*CLI)) CLI {
 		c := defaults
 		f(&c)
@@ -605,16 +605,16 @@ func TestCLIGrammar(t *testing.T) {
 				c.Verbose = 1
 				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "k.pub", Hosts: []string{"h"}}
 			}), akHostsCmd},
-		{"connect-default before implicit check", []string{"--connect-default=ip", "-c", "cfg"},
-			with(func(c *CLI) { c.ConnectDefault = "ip"; c.Config = "cfg" }), checkCmd},
-		{"connect-default before check", []string{"--connect-default", "ip", "check", "-i", "k"},
-			with(func(c *CLI) { c.ConnectDefault = "ip"; c.Check.Identity = "k" }), checkCmd},
-		{"connect-default after check", []string{"check", "--connect-default=ip"},
-			with(func(c *CLI) { c.ConnectDefault = "ip" }), checkCmd},
-		{"connect-default explicit ssh_config", []string{"--connect-default=ssh_config"}, defaults, checkCmd},
-		{"connect-default before authorized-keys", []string{"--connect-default=ip", "authorized-keys", "k.pub", "h"},
+		{"connect-default before implicit check", []string{"--connect-default=ssh_config", "-c", "cfg"},
+			with(func(c *CLI) { c.ConnectDefault = "ssh_config"; c.Config = "cfg" }), checkCmd},
+		{"connect-default before check", []string{"--connect-default", "ssh_config", "check", "-i", "k"},
+			with(func(c *CLI) { c.ConnectDefault = "ssh_config"; c.Check.Identity = "k" }), checkCmd},
+		{"connect-default after check", []string{"check", "--connect-default=ssh_config"},
+			with(func(c *CLI) { c.ConnectDefault = "ssh_config" }), checkCmd},
+		{"connect-default explicit ip", []string{"--connect-default=ip"}, defaults, checkCmd},
+		{"connect-default before authorized-keys", []string{"--connect-default=ssh_config", "authorized-keys", "k.pub", "h"},
 			with(func(c *CLI) {
-				c.ConnectDefault = "ip"
+				c.ConnectDefault = "ssh_config"
 				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "k.pub", Hosts: []string{"h"}}
 			}), akHostsCmd},
 		{"connect-default after authorized-keys", []string{"authorized-keys", "--connect-default", "ip", "k.pub"},

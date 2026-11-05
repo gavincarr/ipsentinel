@@ -50,9 +50,9 @@ func TestParseInput(t *testing.T) {
 	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", Config{})
 
 	wantChecks := []Check{
-		{"host1", "10.0.0.1", "ssh_config", "iproute2"},
-		{"host2", "10.0.0.2", "ssh_config", "iproute2"},
-		{"sub.host_alias-1.example.com", "10.0.0.7", "ssh_config", "iproute2"},
+		{"host1", "10.0.0.1", defaultConnect, "iproute2"},
+		{"host2", "10.0.0.2", defaultConnect, "iproute2"},
+		{"sub.host_alias-1.example.com", "10.0.0.7", defaultConnect, "iproute2"},
 	}
 	if len(checks) != len(wantChecks) {
 		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(wantChecks), checks)
@@ -111,7 +111,7 @@ func TestParseInputStrip(t *testing.T) {
 	// stripAll=true reduces each validated hostname to its leftmost label.
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", Config{})
-	wantStripped := []Check{{"foo", "10.0.0.1", "ssh_config", "iproute2"}, {"bar", "10.0.0.2", "ssh_config", "iproute2"}}
+	wantStripped := []Check{{"foo", "10.0.0.1", defaultConnect, "iproute2"}, {"bar", "10.0.0.2", defaultConnect, "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -156,7 +156,7 @@ func TestParseInputStripDomain(t *testing.T) {
 	// domain suffix is stripped only where it matches; other hosts pass through.
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com", Config{})
-	want := []Check{{"foo", "10.0.0.1", "ssh_config", "iproute2"}, {"bar.other.com", "10.0.0.2", "ssh_config", "iproute2"}, {"baz", "10.0.0.3", "ssh_config", "iproute2"}}
+	want := []Check{{"foo", "10.0.0.1", defaultConnect, "iproute2"}, {"bar.other.com", "10.0.0.2", defaultConnect, "iproute2"}, {"baz", "10.0.0.3", defaultConnect, "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -184,9 +184,9 @@ func TestParseInputValidatesIP(t *testing.T) {
 	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", Config{})
 
 	want := []Check{
-		{"host1", "10.0.0.1", "ssh_config", "iproute2"},
-		{"host5", "fe80::1", "ssh_config", "iproute2"},
-		{"host6", "fe80::1", "ssh_config", "iproute2"},
+		{"host1", "10.0.0.1", defaultConnect, "iproute2"},
+		{"host5", "fe80::1", defaultConnect, "iproute2"},
+		{"host6", "fe80::1", defaultConnect, "iproute2"},
 	}
 	if failures != 3 {
 		t.Errorf("got %d failures, want 3", failures)
@@ -246,8 +246,8 @@ func TestParseInputConfig(t *testing.T) {
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", config)
 	want := []Check{
-		{"foo", "10.0.0.1", "ssh_config", "aws"},
-		{"bar", "10.0.0.2", "ssh_config", "iproute2"},
+		{"foo", "10.0.0.1", defaultConnect, "aws"},
+		{"bar", "10.0.0.2", defaultConnect, "iproute2"},
 		{"gw", "10.0.0.3", "ip", "none"},
 	}
 	if failures != 0 {
@@ -257,12 +257,12 @@ func TestParseInputConfig(t *testing.T) {
 		t.Errorf("checks = %+v, want %+v", checks, want)
 	}
 
-	// A zero Config defaults every check to ssh_config + iproute2.
+	// A zero Config defaults every check to defaultConnect (ip) + iproute2.
 	var alerter2 captureAlerter
 	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", Config{})
 	for i, c := range checks {
-		if c.Connect != "ssh_config" || c.CheckName != "iproute2" {
-			t.Errorf("zero-config check[%d] = %+v, want ssh_config/iproute2", i, c)
+		if c.Connect != defaultConnect || c.CheckName != "iproute2" {
+			t.Errorf("zero-config check[%d] = %+v, want %s/iproute2", i, c, defaultConnect)
 		}
 	}
 
@@ -270,8 +270,8 @@ func TestParseInputConfig(t *testing.T) {
 	var alerter3 captureAlerter
 	checks, _ = parseInput(strings.NewReader(input), &alerter3, false, "",
 		Config{Hosts: map[string]HostConfig{"foo.example.com": {}}})
-	if checks[0].Connect != "ssh_config" || checks[0].CheckName != "iproute2" {
-		t.Errorf("empty-entry check = %+v, want ssh_config/iproute2", checks[0])
+	if checks[0].Connect != defaultConnect || checks[0].CheckName != "iproute2" {
+		t.Errorf("empty-entry check = %+v, want %s/iproute2", checks[0], defaultConnect)
 	}
 
 	// --connect-default=ip applies to entries without connect and to absent
