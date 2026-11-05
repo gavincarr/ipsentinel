@@ -20,20 +20,24 @@ Usage
 
     ipsentinel [check] [flags] < hosts.csv
     ipsentinel authorized-keys [--from PATTERNS] PUBKEY [HOST...]
+    ipsentinel known-hosts [flags] < hosts.csv
 
-`ipsentinel` has two commands. `check` (the default) runs the checks;
+`ipsentinel` has three commands. `check` (the default) runs the checks;
 `authorized-keys` generates locked-down `authorized_keys` lines for the
-monitoring key instead (see [Authorized keys](#authorized-keys)). Since
+monitoring key instead (see [Authorized keys](#authorized-keys));
+`known-hosts` prints `known_hosts` lines for `connect: ip` hosts (see
+[Known hosts](#known-hosts)). Since
 `check` is the default, the command name can be left off and its flags
 given directly, so `ipsentinel -i KEY -c ipsentinel.yml -s example.com`
 and `ipsentinel check -i KEY -c ipsentinel.yml -s example.com` are
 equivalent.
 
 Only `-c`/`--config`, `--connect-default` and `-v`/`--verbose` are
-shared by both commands; they may go before or after the command name. The remaining flags
-(`-i`, `-s`/`--strip`, `-S`/`--strip-all`, `-C`, `-t`, `-r`,
-`--retry-delay`) belong to `check`: `ipsentinel check --help` lists
-them, and they are rejected with `authorized-keys`.
+shared by all commands; they may go before or after the command name.
+The remaining flags (`-i`, `-s`/`--strip`, `-S`/`--strip-all`, `-C`,
+`-t`, `-r`, `--retry-delay`) belong to `check`: `ipsentinel check
+--help` lists them, and they are rejected with `authorized-keys`.
+`known-hosts` also takes `-s` and `-S`, but only after its name.
 
 `ipsentinel` reads `hostname,ip` pairs on stdin, one per line. Blank
 lines and lines beginning with `#` are ignored. Both IPv4 and IPv6
@@ -245,11 +249,16 @@ still come from the host's `~/.ssh/config` entry. E.g. with
 connects to `116.202.209.119` port 1027.
 
 ipsentinel deliberately won't auto-accept host keys (that would defeat
-the check), so each `connect: ip` host needs a one-off interactive setup
-to record its key under the new name, `[<ip>]:<port>` (or just `<ip>`
-on port 22). Until that's done — and again whenever such a host's ip
-changes, or a new one is added (including via `--connect-default=ip`) —
-its check fails with `Host key verification failed`:
+the check), so each `connect: ip` host needs a one-off setup to record
+its key under the new name, `[<ip>]:<port>` (or just `<ip>` on port 22).
+Until that's done — and again whenever such a host's ip changes, or a
+new one is added (including via `--connect-default=ip`) — its check
+fails with `Host key verification failed`.
+
+`ipsentinel known-hosts` is the first-line fix: it prints the lines to
+add (see [Known hosts](#known-hosts)). For a host it can't handle (it
+reports hosts with no known key under the usual name), do the setup by
+hand:
 
 1. Get the fingerprint of the host's known-good key, as already
    recorded under its usual name:
@@ -267,7 +276,57 @@ its check fails with `Host key verification failed`:
 
 The host key is then stored in `known_hosts` under two names, the host's
 usual one and the ip one, so if the host's key is ever rotated, update
-both entries.
+both entries. Re-running `known-hosts` after a rotation won't replace
+the stale ip entry: it reports a foreign key on the ip instead.
+
+
+Known hosts
+-----------
+
+A `connect: ip` check looks the server's key up under the ip name, so
+until the ip has an entry in `known_hosts` it fails every host.
+`ipsentinel known-hosts` prints the missing entries: for each
+`connect: ip` host on stdin, it copies the key(s) already trusted for
+the host under its usual name to the ip name (`[<ip>]:<port>`, or just
+`<ip>` on port 22).
+
+It runs `ssh -G` and `ssh-keygen -F` to find the names and keys, and
+**connects to nothing**. That is safe because a `known_hosts` line holds
+only a public key: it records that this ip must prove it holds the
+host's private key, and the next `check` run's handshake does the
+proving. If the ip reaches some other machine, `check` fails.
+
+Hosts are read from stdin like `check` does, and `-c`, `--connect-default`
+and `-s`/`-S` work the same way (`-i` isn't taken). Only `connect: ip`
+hosts are considered. Output on stdout is `known_hosts` lines only;
+messages go to stderr. Review the lines, then append them:
+
+    $ tinydnsip -d example.com data |
+        ipsentinel known-hosts -c ipsentinel.yml -s example.com --connect-default ip
+    [192.0.2.10]:2222 ssh-ed25519 AAAA...
+    $ tinydnsip -d example.com data |
+        ipsentinel known-hosts -c ipsentinel.yml -s example.com --connect-default ip >> ~/.ssh/known_hosts
+
+Things to know:
+
+- **Hashing follows `HashKnownHosts`.** If ssh would hash names for the
+  host, so do the printed lines.
+- **Re-runs are idempotent.** A key already recorded under the ip name
+  isn't printed again, so a second run prints nothing new.
+- **Hosts with a `HostKeyAlias`** need nothing: ssh already looks the ip
+  up under the alias, and they are skipped.
+- **The exit code is 1 if any host has a problem**, and nothing is
+  printed for that host. Each problem is logged:
+  - `no known host key for host; add it by hand, see README`: no key
+    is recorded under the host's usual name, so there is nothing to
+    copy. Use the manual steps under [`connect: ip`](#connect-ip).
+  - `ip already has a different host key; not adding`: the ip name
+    already holds a key that isn't one of the host's. Investigate
+    before doing anything else (the ip may reach a different machine,
+    or the host's key may have rotated); don't override it blindly.
+  - Others: `ssh -G failed` for the host, or an unreadable
+    `known_hosts` file (`looking up host key failed`), which is reported
+    rather than skipped so it can't hide a key.
 
 
 Authorized keys
