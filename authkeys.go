@@ -1,6 +1,6 @@
-// The authorized-keys command: instead of running checks, generate one
-// OpenSSH authorized_keys line per ssh target that forces the monitoring key
-// to run exactly the command ipsentinel would send that host.
+// The authorized-keys command: instead of running checks, generate OpenSSH
+// authorized_keys lines that force the monitoring key to run exactly the
+// command ipsentinel would send each host (or each check variant).
 package main
 
 import (
@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -130,69 +132,171 @@ func describeType(c Check) string {
 	return c.Type
 }
 
-// runAuthorizedKeys implements the authorized-keys command. It parses checks
-// from r exactly as a check run does (same config, stripping and
-// parse-failure alerts), then writes one TSV line `<target>\t<authorized_keys line>` to w
-// per distinct ssh target, in first-seen order. tinydns-style input often
-// lists a host twice (A and AAAA), so targets are deduped. A target reached
-// with differing forced commands (two input names stripped to one target but
-// configured with different types) is an error: it's logged and omitted
-// rather than guessed at. Returns the exit code: 1 if there were parse
-// failures or omitted targets, else 0.
-func runAuthorizedKeys(cli CLI, config map[string]HostConfig, log *slog.Logger,
-	r io.Reader, w io.Writer, pubkey string, from []string) int {
-	alerter := LogAlerter{log: log}
+// akRow is one row of authorized-keys output: a label (a host as given, or
+// a check variant name) and its authorized_keys line.
+type akRow struct {
+	label, line string
+}
 
-	checks, parseFailures := parseInput(r, alerter, cli.StripAll, cli.Strip, config)
-	if parseFailures > 0 {
-		log.Warn("input had malformed lines", "count", parseFailures)
+// writeTable writes rows to w as a two-column table: the label, padded with
+// spaces to the longest label plus two, then the authorized_keys line, so
+// every line starts in the same column. No tabs, no header, no trailing
+// whitespace. Labels never contain whitespace (hosts are validHostname, and
+// variant names are fixed), so `while read -r label line` with the default
+// IFS splits each row back into the label and the byte-identical line: read
+// strips the padding before the last field but keeps its internal spacing.
+func writeTable(w io.Writer, rows []akRow) error {
+	width := 0
+	for _, r := range rows {
+		width = max(width, len(r.label))
 	}
-	log.Info("parsed input", "checks", len(checks))
+	width += 2
+	for _, r := range rows {
+		if _, err := fmt.Fprintf(w, "%-*s%s\n", width, r.label, r.line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	type target struct {
-		first  Check
-		forced string
-		bad    bool // conflict or unbuildable command: omit from output
+// variant is a named check variant: a check type, plus an ip_version for the
+// ifconfig variants that pin curl's address family.
+type variant struct {
+	label string
+	check Check
+}
+
+// variantTypeOrder is the preferred display order of check types in variant
+// mode. Types in checkCommands but missing here still appear, sorted, after
+// these, so a new type can never be silently left out.
+var variantTypeOrder = []string{"iproute2", "aws", "ifconfig"}
+
+// checkVariants returns every distinct check variant: each checkCommands
+// type, and for ifconfig one extra variant per ip_version (ifconfig-v4,
+// ifconfig-v6), since ip_version changes the forced command.
+func checkVariants() []variant {
+	var types []string
+	for _, t := range variantTypeOrder {
+		if _, ok := checkCommands[t]; ok {
+			types = append(types, t)
+		}
 	}
-	var order []string
-	targets := make(map[string]*target)
-	for _, c := range checks {
+	for _, t := range slices.Sorted(maps.Keys(checkCommands)) {
+		if !slices.Contains(types, t) {
+			types = append(types, t)
+		}
+	}
+	var vs []variant
+	for _, t := range types {
+		vs = append(vs, variant{t, Check{Type: t}})
+		if t == "ifconfig" {
+			for _, v := range ipVersions {
+				vs = append(vs, variant{t + "-v" + v, Check{Type: t, IPVersion: v}})
+			}
+		}
+	}
+	return vs
+}
+
+// resolveHost builds the Check for host (labelled exactly as given; no
+// stripping) from config. An exact config key wins. Otherwise the keys
+// starting with host+"." are candidates, so a short name like web1 finds
+// web1.example.com: none means host isn't configured (default type); one is
+// used; several are fine only if they all yield the same forced command,
+// else it's an error naming each candidate and its type.
+func resolveHost(host string, config map[string]HostConfig) (Check, error) {
+	mk := func(hc HostConfig) Check {
+		return Check{Hostname: host, Type: hc.checkType(), IPVersion: hc.IPVersion}
+	}
+	if hc, ok := config[host]; ok {
+		return mk(hc), nil
+	}
+	var keys []string
+	for k := range config {
+		if strings.HasPrefix(k, host+".") {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	if len(keys) == 0 {
+		return mk(HostConfig{}), nil
+	}
+	c := mk(config[keys[0]])
+	want := remoteCommand(c)
+	for _, k := range keys[1:] {
+		if remoteCommand(mk(config[k])) != want {
+			descs := make([]string, len(keys))
+			for i, k := range keys {
+				descs[i] = k + " (" + describeType(mk(config[k])) + ")"
+			}
+			return Check{}, fmt.Errorf("ambiguous: matches config entries with different check types: %s",
+				strings.Join(descs, ", "))
+		}
+	}
+	return c, nil
+}
+
+// runAuthorizedKeys implements the authorized-keys command, writing a table
+// of authorized_keys lines to w (see writeTable). It deliberately takes its
+// hosts as a list, never a reader: it must not read stdin. With hosts, it
+// writes one row per distinct host (first-seen order), labelled as given and
+// resolved against config by resolveHost; an invalid or unresolvable host is
+// logged and skipped. Without hosts, it writes one row per check variant
+// (see checkVariants), ignoring config. A missing --from is warned about,
+// since the lines then accept the key from anywhere. Returns the exit code:
+// 1 if any host was skipped, else 0.
+func runAuthorizedKeys(hosts []string, config map[string]HostConfig, log *slog.Logger,
+	w io.Writer, pubkey string, from []string) int {
+	if len(from) == 0 {
+		log.Warn("no --from given; generated lines allow the key from any address")
+	}
+
+	var rows []akRow
+	var skipped int
+	add := func(label string, c Check) {
 		forced, err := forcedCommand(c)
-		t, seen := targets[c.Hostname]
-		if !seen {
-			t = &target{first: c, forced: forced}
-			targets[c.Hostname] = t
-			order = append(order, c.Hostname)
+		if err != nil {
+			log.Error("cannot build forced command; skipping", "host", label, "err", err)
+			skipped++
+			return
 		}
-		switch {
-		case err != nil:
-			log.Error("cannot build forced command", "target", c.Hostname, "err", err)
-			t.bad = true
-		case seen && !t.bad && forced != t.forced:
-			log.Error("conflicting check types for one ssh target; omitting it",
-				"target", c.Hostname, "type", describeType(t.first), "other_type", describeType(c))
-			t.bad = true
+		rows = append(rows, akRow{label, authorizedKeysLine(forced, from, pubkey)})
+	}
+
+	if len(hosts) == 0 {
+		for _, v := range checkVariants() {
+			add(v.label, v.check)
+		}
+	} else {
+		seen := make(map[string]bool)
+		for _, host := range hosts {
+			if seen[host] {
+				continue
+			}
+			seen[host] = true
+			if !validHostname.MatchString(host) {
+				log.Error("invalid hostname; skipping", "host", host)
+				skipped++
+				continue
+			}
+			c, err := resolveHost(host, config)
+			if err != nil {
+				log.Error("cannot resolve check type; skipping", "host", host, "err", err)
+				skipped++
+				continue
+			}
+			add(host, c)
 		}
 	}
 
-	var omitted, written int
-	for _, name := range order {
-		t := targets[name]
-		if t.bad {
-			omitted++
-			continue
-		}
-		if _, err := fmt.Fprintf(w, "%s\t%s\n", name, authorizedKeysLine(t.forced, from, pubkey)); err != nil {
-			log.Error("writing output", "err", err)
-			return 1
-		}
-		written++
-	}
-
-	if parseFailures > 0 || omitted > 0 {
-		log.Warn("finished with failures", "targets", written, "omitted", omitted, "parse_failures", parseFailures)
+	if err := writeTable(w, rows); err != nil {
+		log.Error("writing output", "err", err)
 		return 1
 	}
-	log.Info("generated authorized_keys lines", "targets", written)
+	if skipped > 0 {
+		log.Warn("finished with failures", "lines", len(rows), "skipped", skipped)
+		return 1
+	}
+	log.Info("generated authorized_keys lines", "lines", len(rows))
 	return 0
 }

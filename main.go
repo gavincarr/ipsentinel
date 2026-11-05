@@ -29,24 +29,23 @@ import (
 )
 
 // CLI holds the command-line configuration. The root flags are shared by
-// every command, since both must resolve check types (config) and ssh
-// targets (stripping) identically; the per-command settings live on the
-// command structs.
+// every command; the per-command settings live on the command structs.
 type CLI struct {
-	Config   string `kong:"name='config',short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
-	Strip    string `kong:"name='strip',short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
-	StripAll bool   `kong:"name='strip-all',short='S',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
-	Verbose  int    `kong:"name='verbose',short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
+	Config  string `kong:"name='config',short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
+	Verbose int    `kong:"name='verbose',short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
 
 	// check is the default command, and "withargs" lets its flags be given
-	// without naming it, so `ipsentinel -i KEY -c CFG < hosts` still works.
+	// without naming it, so `ipsentinel -i KEY -c CFG -s DOMAIN < hosts`
+	// still works.
 	Check          CheckCmd          `kong:"cmd,name='check',default='withargs',help='Check each hostname,ip pair on stdin via ssh, alerting on any failure (the default command).'"`
-	AuthorizedKeys AuthorizedKeysCmd `kong:"cmd,name='authorized-keys',help='Run no checks. Instead, for each distinct ssh target on stdin, print a TSV line (target, TAB, authorized_keys line) that locks the key down to exactly the command ipsentinel would run on that host. Requires OpenSSH 7.2+ on the targets; see README.'"`
+	AuthorizedKeys AuthorizedKeysCmd `kong:"cmd,name='authorized-keys',help='Run no checks, and read no stdin. Instead print a table of authorized_keys lines that lock the key down to exactly the command ipsentinel would run: one per HOST given, or one per check variant if none. Requires OpenSSH 7.2+ on the targets; see README.'"`
 }
 
 // CheckCmd holds the settings for the check command.
 type CheckCmd struct {
 	Identity    string        `kong:"name='identity',short='i',placeholder='PATH',help='SSH identity (private key) to use for every check. Also sets IdentitiesOnly=yes so only this key is offered — useful under cron, where no agent is present and the default keys need a passphrase.'"`
+	Strip       string        `kong:"name='strip',short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
+	StripAll    bool          `kong:"name='strip-all',short='S',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
 	Concurrency int           `kong:"name='concurrency',short='C',default='8',help='Number of ssh checks to run in parallel.'"`
 	Timeout     time.Duration `kong:"name='timeout',short='t',default='10s',help='Per-check ssh timeout.'"`
 	Retries     int           `kong:"name='retries',short='r',default='2',help='Number of retry passes for transient (soft) ssh failures.'"`
@@ -54,10 +53,34 @@ type CheckCmd struct {
 }
 
 // AuthorizedKeysCmd holds the settings for the authorized-keys command:
-// generate forced-command lines instead of checking.
+// generate forced-command lines instead of checking. It never reads stdin:
+// the hosts, if any, are positional arguments.
 type AuthorizedKeysCmd struct {
-	Pubkey string `kong:"arg,name='pubkey',placeholder='PUBKEY',help='OpenSSH public key file to lock down (the .pub, not the private key).'"`
-	From   string `kong:"name='from',placeholder='PATTERNS',help='Comma-separated sshd from= patterns (IPs, CIDRs, hostname patterns, !negations) restricting where the key may be used from.'"`
+	Pubkey string   `kong:"arg,name='pubkey',placeholder='PUBKEY',help='OpenSSH public key file to lock down (the .pub, not the private key).'"`
+	Hosts  []string `kong:"arg,optional,name='host',placeholder='HOST',help='Hosts to generate lines for, labelled exactly as given. Each is matched to a config entry by exact key, else by the keys starting with HOST followed by a dot (which must agree on the check type). With none, print one line per check variant instead.'"`
+	From   string   `kong:"name='from',placeholder='PATTERNS',help='Comma-separated sshd from= patterns (IPs, CIDRs, hostname patterns, !negations) restricting where the key may be used from.'"`
+}
+
+// AfterApply rejects check flags given before the authorized-keys command
+// name. Because check is the "withargs" default, kong accepts its flags
+// ahead of any command, so `ipsentinel -s x authorized-keys k.pub` would
+// otherwise parse and silently ignore -s.
+func (a *AuthorizedKeysCmd) AfterApply(kctx *kong.Context) error {
+	var check *kong.Node
+	for _, n := range kctx.Model.Children {
+		if n.Name == "check" {
+			check = n
+		}
+	}
+	if check == nil {
+		return nil
+	}
+	for _, p := range kctx.Path {
+		if p.Flag != nil && slices.Contains(check.Flags, p.Flag) {
+			return fmt.Errorf("--%s is a check flag and cannot be used with authorized-keys", p.Flag.Name)
+		}
+	}
+	return nil
 }
 
 // Check is a single hostname,ip pair to verify.
@@ -123,7 +146,7 @@ func main() {
 		kong.Name("ipsentinel"),
 		kong.Description("Verify that hosts still hold their expected IP addresses via ssh, "+
 			"reading hostname,ip pairs on stdin.\n\n"+
-			"With no command, runs check, whose flags (-i, -C, -t, -r, --retry-delay) "+
+			"With no command, runs check, whose flags (-i, -s, -S, -C, -t, -r, --retry-delay) "+
 			"may then be given without naming it: see \"ipsentinel check --help\"."),
 		kong.Help(helpcolours.Help),
 		kong.ShortHelp(helpcolours.ShortHelp),
@@ -187,19 +210,18 @@ func main() {
 		}
 	}
 
-	switch cmd := kctx.Command(); cmd {
+	switch cmd := kctx.Selected().Name; cmd {
 	case "check":
 		os.Exit(run(cli, config, log, os.Stdin))
-	case "authorized-keys <pubkey>":
-		// Validate the key before touching stdin, so a bad path fails fast.
+	case "authorized-keys":
 		pubkey, err := loadPubkey(cli.AuthorizedKeys.Pubkey)
 		if err != nil {
 			log.Error("loading public key", "err", err)
 			os.Exit(1)
 		}
-		os.Exit(runAuthorizedKeys(cli, config, log, os.Stdin, os.Stdout, pubkey, from))
+		os.Exit(runAuthorizedKeys(cli.AuthorizedKeys.Hosts, config, log, os.Stdout, pubkey, from))
 	default:
-		log.Error("unknown command", "command", cmd)
+		log.Error("unknown command", "command", kctx.Command())
 		os.Exit(1)
 	}
 }
@@ -209,7 +231,7 @@ func main() {
 func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) int {
 	alerter := LogAlerter{log: log}
 
-	checks, parseFailures := parseInput(r, alerter, cli.StripAll, cli.Strip, config)
+	checks, parseFailures := parseInput(r, alerter, cli.Check.StripAll, cli.Check.Strip, config)
 	if parseFailures > 0 {
 		log.Warn("input had malformed lines", "count", parseFailures)
 	}
@@ -262,21 +284,14 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 		ip = addr.String()
 		// Resolve the check type before stripping: config is keyed by the
 		// hostname as it appears on stdin.
-		ctype := defaultCheckType
-		var ipVersion string
-		if hc, ok := config[host]; ok {
-			if hc.Type != "" {
-				ctype = hc.Type
-			}
-			ipVersion = hc.IPVersion
-		}
+		hc := config[host] // zero value (default type) when absent
 		if domain != "" {
 			host = stripDomain(host, domain)
 		}
 		if stripAll {
 			host = stripHostname(host)
 		}
-		checks = append(checks, Check{Hostname: host, IP: ip, Type: ctype, IPVersion: ipVersion})
+		checks = append(checks, Check{Hostname: host, IP: ip, Type: hc.checkType(), IPVersion: hc.IPVersion})
 	}
 	if err := sc.Err(); err != nil {
 		alerter.Alert(Check{}, "error reading stdin", err)

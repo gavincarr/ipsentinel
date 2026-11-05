@@ -70,6 +70,18 @@ type HostConfig struct {
 	IPVersion string `yaml:"ip_version"`
 }
 
+// checkType returns hc's check type, defaulting to defaultCheckType when
+// unset (including for the zero HostConfig of a host absent from config).
+func (hc HostConfig) checkType() string {
+	if hc.Type == "" {
+		return defaultCheckType
+	}
+	return hc.Type
+}
+
+// ipVersions are the accepted ip_version values (see HostConfig.IPVersion).
+var ipVersions = []string{"4", "6"}
+
 // loadConfig reads the YAML config file at path: a map keyed by (unstripped)
 // hostname with per-host settings. Unknown second-level keys and unknown
 // type values are errors, so typos fail loudly at startup rather than
@@ -90,7 +102,7 @@ func loadConfig(path string) (map[string]HostConfig, error) {
 	}
 	for host, hc := range config {
 		if hc.IPVersion != "" {
-			if hc.IPVersion != "4" && hc.IPVersion != "6" {
+			if !slices.Contains(ipVersions, hc.IPVersion) {
 				return nil, fmt.Errorf(`%s: host %s: invalid ip_version %q (want "4" or "6")`,
 					path, host, hc.IPVersion)
 			}

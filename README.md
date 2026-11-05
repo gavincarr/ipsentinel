@@ -19,7 +19,7 @@ Usage
 -----
 
     ipsentinel [check] [flags] < hosts.csv
-    ipsentinel authorized-keys [flags] PUBKEY < hosts.csv
+    ipsentinel authorized-keys [--from PATTERNS] PUBKEY [HOST...]
 
 `ipsentinel` has two commands. `check` (the default) runs the checks;
 `authorized-keys` generates locked-down `authorized_keys` lines for the
@@ -29,12 +29,11 @@ given directly, so `ipsentinel -i KEY -c ipsentinel.yml -s example.com`
 and `ipsentinel check -i KEY -c ipsentinel.yml -s example.com` are
 equivalent.
 
-The `-c`/`--config`, `-s`/`--strip`, `-S`/`--strip-all` and
-`-v`/`--verbose` flags are shared by both commands, so they resolve
-check types and ssh targets identically; they may go before or after
-the command name. The remaining flags (`-i`, `-C`, `-t`, `-r`,
+Only `-c`/`--config` and `-v`/`--verbose` are shared by both commands;
+they may go before or after the command name. The remaining flags
+(`-i`, `-s`/`--strip`, `-S`/`--strip-all`, `-C`, `-t`, `-r`,
 `--retry-delay`) belong to `check`: `ipsentinel check --help` lists
-them.
+them, and they are rejected with `authorized-keys`.
 
 `ipsentinel` reads `hostname,ip` pairs on stdin, one per line. Blank
 lines and lines beginning with `#` are ignored. Both IPv4 and IPv6
@@ -55,8 +54,9 @@ becomes `web1`):
     $ ipsentinel -s example.com < hosts.csv
 
 Or reduce every hostname to its leftmost label with `-S`/`--strip-all`
-(`web1.example.com` => `web1`). Run `ipsentinel --help` for the shared
-options and `ipsentinel check --help` for the check options.
+(`web1.example.com` => `web1`). `-s` and `-S` are mutually exclusive.
+Run `ipsentinel --help` for the shared options and
+`ipsentinel check --help` for the check options.
 
 
 Output
@@ -162,42 +162,67 @@ Authorized keys
 
 The monitoring key only ever needs to run one command on each host, so
 it can be locked down on the targets with an `authorized_keys` forced
-command. `ipsentinel authorized-keys PUBKEY` generates those lines from
-the same source of truth ipsentinel uses for its checks, so each host's
-line forces exactly the command ipsentinel sends it.
+command. `ipsentinel authorized-keys PUBKEY [HOST...]` generates those
+lines from the same source of truth ipsentinel uses for its checks, so
+each host's line forces exactly the command ipsentinel sends it.
 
-The `authorized-keys` command runs **no checks**. It reads stdin
-exactly as normal (same `-c`, `-s`/`-S` handling, same alerts for
-malformed lines) and prints one tab-separated line per distinct ssh
-target to stdout, in input order:
+The `authorized-keys` command runs **no checks and never reads stdin**:
+the hosts are given as arguments. `PUBKEY` is an OpenSSH public key file
+(e.g. `/root/.ssh/id_ipsentinel.pub` — the `.pub`, not the private key).
+Output is a two-column table on stdout — a label, then the
+`authorized_keys` line, with the labels padded with spaces so the lines
+line up (no tabs, no header):
 
-    <target><TAB>[from="...",]restrict,command="<check command>" <public key>
+    <label>  [from="...",]restrict,command="<check command>" <public key>
 
-`PUBKEY` is an OpenSSH public key file (e.g. `/root/.ssh/id_ipsentinel.pub`
-— the `.pub`, not the private key). The target is the hostname after any
-`-s`/`-S` stripping, i.e. what ssh is given. Hosts that appear more than
-once (as tinydns A and AAAA records often do) get a single line. If two
-input names strip to the same target but have different check types,
-that target is omitted with an error rather than guessed at. The exit
-code is 1 if any target was omitted or any input line was malformed.
+With **HOST arguments**, there is one row per host, in the order given
+(repeats are printed once). Each label is the host exactly as given —
+no stripping — so pass the names you'll ssh to. Each host's check type
+comes from the `-c` config file:
+
+- a config key equal to the host wins;
+- otherwise, the config keys starting with the host plus a dot are
+  candidates, so `web1` finds `web1.example.com`. If several match
+  (`web1.example.com` and `web1.example.net`), they must all have the
+  same check type, or the host is skipped with an error naming them;
+- a host matching no key (or with no `-c` at all) uses the default,
+  `iproute2`.
+
+An invalid hostname is likewise skipped with an error. The exit code is
+1 if any host was skipped, else 0.
+
+    $ ipsentinel -c ipsentinel.yml authorized-keys --from 192.0.2.10 \
+        ~/.ssh/id_ipsentinel.pub web1 db.example.com
+    web1            from="192.0.2.10",restrict,command="ip address" ssh-ed25519 AAAA... root@monitor
+    db.example.com  from="192.0.2.10",restrict,command="ip address; TOKEN=..." ssh-ed25519 AAAA... root@monitor
+
+With **no HOST arguments**, there is one row per check variant instead,
+labelled `iproute2`, `aws`, `ifconfig`, `ifconfig-v4` and `ifconfig-v6`
+(the last two being `ifconfig` with `ip_version` 4 and 6) — handy for
+pasting by hand. `-c` is not used in this mode.
 
 `--from PATTERNS` adds an sshd `from=` restriction: a comma-separated
 list of the addresses, CIDRs or hostname patterns (with `!` negation)
 the key may be used from — normally the monitoring host's address(es).
-
-    $ ipsentinel -c ipsentinel.yml -s example.com \
-        authorized-keys --from 192.0.2.10 ~/.ssh/id_ipsentinel.pub < hosts.csv
-    web1	from="192.0.2.10",restrict,command="ip address" ssh-ed25519 AAAA... root@monitor
+Without it, a warning is logged on stderr, since the generated lines
+then accept the key from any address; the output is still produced and
+the exit code unaffected.
 
 To deploy, pipe each line to its host over ssh's stdin (which needs no
 quoting, unlike embedding the line — which contains double quotes and
-`$` — in a remote command string). The deploying ssh must of course use
-a key other than the one being locked down:
+`$` — in a remote command string). Because each `ssh` reads from its own
+`printf` pipe, it can't swallow the rest of the loop's input. The
+deploying ssh must of course use a key other than the one being locked
+down:
 
-    ipsentinel -c ipsentinel.yml -s example.com authorized-keys --from 192.0.2.10 ~/.ssh/id_ipsentinel.pub < hosts.csv |
-      while IFS="$(printf '\t')" read -r host line; do
+    ipsentinel -c ipsentinel.yml authorized-keys --from 192.0.2.10 ~/.ssh/id_ipsentinel.pub host1 host2 |
+      while read -r host line; do
         printf '%s\n' "$line" | ssh "$host" 'umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys'
       done
+
+`read -r` with the default `IFS` puts the label in `host` and the rest
+of the row, with the padding stripped but otherwise byte-for-byte, in
+`line`.
 
 Things to know:
 
