@@ -404,9 +404,10 @@ func (f *fakeChecker) check(_ context.Context, _ time.Duration, c Check) error {
 func softErr() error { return fmt.Errorf("ssh timed out after 10s") }
 func hardErr() error { return fmt.Errorf("ssh failed: Permission denied (publickey).") }
 
-// testCLI returns a CLI with sleeping disabled so retry tests run instantly.
-func testCLI(retries int) CLI {
-	return CLI{Concurrency: 4, Timeout: time.Second, Retries: retries, RetryDelay: 0}
+// testCheckCmd returns check settings with sleeping disabled so retry tests
+// run instantly.
+func testCheckCmd(retries int) CheckCmd {
+	return CheckCmd{Concurrency: 4, Timeout: time.Second, Retries: retries, RetryDelay: 0}
 }
 
 func TestRunPass(t *testing.T) {
@@ -423,7 +424,7 @@ func TestRunPass(t *testing.T) {
 	var failures atomic.Int64
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	soft := runPass(context.Background(), testCLI(2), checks, fc.check, &alerter, log, &failures)
+	soft := runPass(context.Background(), testCheckCmd(2), checks, fc.check, &alerter, log, &failures)
 
 	if len(soft) != 1 || soft[0].c.Hostname != "soft" {
 		t.Fatalf("soft = %+v, want one entry for host \"soft\"", soft)
@@ -457,7 +458,7 @@ func TestRetryLoop(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fc := newFakeChecker(map[string][]error{"h": tt.script})
 			var alerter captureAlerter
-			exit := runChecks(context.Background(), testCLI(tt.retries),
+			exit := runChecks(context.Background(), testCheckCmd(tt.retries),
 				[]Check{{Hostname: "h"}}, 0, &alerter, log, fc.check)
 
 			if fc.calls["h"] != tt.wantCalls {

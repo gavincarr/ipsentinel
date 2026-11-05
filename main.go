@@ -28,17 +28,36 @@ import (
 	"golang.org/x/term"
 )
 
-// CLI holds the command-line configuration.
+// CLI holds the command-line configuration. The root flags are shared by
+// every command, since both must resolve check types (config) and ssh
+// targets (stripping) identically; the per-command settings live on the
+// command structs.
 type CLI struct {
-	Config      string        `kong:"short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
-	Identity    string        `kong:"short='i',placeholder='PATH',help='SSH identity (private key) to use for every check. Also sets IdentitiesOnly=yes so only this key is offered — useful under cron, where no agent is present and the default keys need a passphrase.'"`
-	Concurrency int           `kong:"short='C',default='8',help='Number of ssh checks to run in parallel.'"`
-	Timeout     time.Duration `kong:"short='t',default='10s',help='Per-check ssh timeout.'"`
-	Retries     int           `kong:"short='r',default='2',help='Number of retry passes for transient (soft) ssh failures.'"`
+	Config   string `kong:"name='config',short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
+	Strip    string `kong:"name='strip',short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
+	StripAll bool   `kong:"name='strip-all',short='S',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
+	Verbose  int    `kong:"name='verbose',short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
+
+	// check is the default command, and "withargs" lets its flags be given
+	// without naming it, so `ipsentinel -i KEY -c CFG < hosts` still works.
+	Check          CheckCmd          `kong:"cmd,name='check',default='withargs',help='Check each hostname,ip pair on stdin via ssh, alerting on any failure (the default command).'"`
+	AuthorizedKeys AuthorizedKeysCmd `kong:"cmd,name='authorized-keys',help='Run no checks. Instead, for each distinct ssh target on stdin, print a TSV line (target, TAB, authorized_keys line) that locks the key down to exactly the command ipsentinel would run on that host. Requires OpenSSH 7.2+ on the targets; see README.'"`
+}
+
+// CheckCmd holds the settings for the check command.
+type CheckCmd struct {
+	Identity    string        `kong:"name='identity',short='i',placeholder='PATH',help='SSH identity (private key) to use for every check. Also sets IdentitiesOnly=yes so only this key is offered — useful under cron, where no agent is present and the default keys need a passphrase.'"`
+	Concurrency int           `kong:"name='concurrency',short='C',default='8',help='Number of ssh checks to run in parallel.'"`
+	Timeout     time.Duration `kong:"name='timeout',short='t',default='10s',help='Per-check ssh timeout.'"`
+	Retries     int           `kong:"name='retries',short='r',default='2',help='Number of retry passes for transient (soft) ssh failures.'"`
 	RetryDelay  time.Duration `kong:"name='retry-delay',default='5s',help='Base backoff before the first retry pass; pass N waits delay*2^(N-1).'"`
-	Strip       string        `kong:"short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
-	StripAll    bool          `kong:"short='S',name='strip-all',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
-	Verbose     int           `kong:"short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
+}
+
+// AuthorizedKeysCmd holds the settings for the authorized-keys command:
+// generate forced-command lines instead of checking.
+type AuthorizedKeysCmd struct {
+	Pubkey string `kong:"arg,name='pubkey',placeholder='PUBKEY',help='OpenSSH public key file to lock down (the .pub, not the private key).'"`
+	From   string `kong:"name='from',placeholder='PATTERNS',help='Comma-separated sshd from= patterns (IPs, CIDRs, hostname patterns, !negations) restricting where the key may be used from.'"`
 }
 
 // Check is a single hostname,ip pair to verify.
@@ -100,9 +119,12 @@ func main() {
 	_ = godotenv.Load(".env.local")
 
 	var cli CLI
-	kong.Parse(&cli,
+	kctx := kong.Parse(&cli,
 		kong.Name("ipsentinel"),
-		kong.Description("Verify that hosts still hold their expected IP addresses via ssh."),
+		kong.Description("Verify that hosts still hold their expected IP addresses via ssh, "+
+			"reading hostname,ip pairs on stdin.\n\n"+
+			"With no command, runs check, whose flags (-i, -C, -t, -r, --retry-delay) "+
+			"may then be given without naming it: see \"ipsentinel check --help\"."),
 		kong.Help(helpcolours.Help),
 		kong.ShortHelp(helpcolours.ShortHelp),
 	)
@@ -141,8 +163,19 @@ func main() {
 	}
 	log := slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{Level: level, NoColor: noColor, ReplaceAttr: stripTime}))
 
-	cli.Concurrency = max(cli.Concurrency, 1)
-	cli.Retries = max(cli.Retries, 0)
+	cli.Check.Concurrency = max(cli.Check.Concurrency, 1)
+	cli.Check.Retries = max(cli.Check.Retries, 0)
+
+	// --from can only be set under authorized-keys (kong scopes it there).
+	var from []string
+	if cli.AuthorizedKeys.From != "" {
+		var err error
+		from, err = parseFrom(cli.AuthorizedKeys.From)
+		if err != nil {
+			log.Error("parsing --from", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	var config map[string]HostConfig
 	if cli.Config != "" {
@@ -154,7 +187,21 @@ func main() {
 		}
 	}
 
-	os.Exit(run(cli, config, log, os.Stdin))
+	switch cmd := kctx.Command(); cmd {
+	case "check":
+		os.Exit(run(cli, config, log, os.Stdin))
+	case "authorized-keys <pubkey>":
+		// Validate the key before touching stdin, so a bad path fails fast.
+		pubkey, err := loadPubkey(cli.AuthorizedKeys.Pubkey)
+		if err != nil {
+			log.Error("loading public key", "err", err)
+			os.Exit(1)
+		}
+		os.Exit(runAuthorizedKeys(cli, config, log, os.Stdin, os.Stdout, pubkey, from))
+	default:
+		log.Error("unknown command", "command", cmd)
+		os.Exit(1)
+	}
 }
 
 // run reads checks from r, runs them (with retries for transient failures),
@@ -169,7 +216,7 @@ func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) i
 	// Info: with the closing summary, this is the pair -v exists to show.
 	log.Info("parsed input", "checks", len(checks))
 
-	return runChecks(context.Background(), cli, checks, parseFailures, alerter, log, runCheckWith(cli.Identity))
+	return runChecks(context.Background(), cli.Check, checks, parseFailures, alerter, log, runCheckWith(cli.Check.Identity))
 }
 
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
@@ -239,18 +286,8 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 }
 
 // sshArgs builds the ssh argv for c: batch-mode options, the target host,
-// and the remote command for the check's type. Unknown or empty types fall
-// back to the default so a zero-value Check still runs a sane command.
+// and the remote command for the check's type (see remoteCommand).
 func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
-	command, ok := checkCommands[c.Type]
-	if !ok {
-		command = checkCommands[defaultCheckType]
-	}
-	// ip_version only shapes the ifconfig curl; loadConfig rejects it for
-	// any other type, so this stays scoped to ifconfig.
-	if c.Type == "ifconfig" && c.IPVersion != "" {
-		command = ifconfigCommand(c.IPVersion)
-	}
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds),
@@ -262,7 +299,24 @@ func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
 	if identityFile != "" {
 		args = append(args, "-i", identityFile, "-o", "IdentitiesOnly=yes")
 	}
-	return append(args, "--", c.Hostname, command)
+	return append(args, "--", c.Hostname, remoteCommand(c))
+}
+
+// remoteCommand returns the shell command run on the target for c's check
+// type. It is the single source of truth shared by the check path (sshArgs)
+// and the authorized-keys path (forcedCommand), so a host's forced command is
+// always exactly what ipsentinel sends it. Unknown or empty types fall back
+// to the default.
+func remoteCommand(c Check) string {
+	// ip_version only shapes the ifconfig curl; loadConfig rejects it for
+	// any other type, so this stays scoped to ifconfig.
+	if c.Type == "ifconfig" && c.IPVersion != "" {
+		return ifconfigCommand(c.IPVersion)
+	}
+	if command, ok := checkCommands[c.Type]; ok {
+		return command
+	}
+	return checkCommands[defaultCheckType]
 }
 
 // softErrorPatterns are the known-transient ssh failure signatures. A check
@@ -307,21 +361,21 @@ type softFail struct {
 // tests substitute a fake so the retry loop can be exercised without ssh.
 type checker func(ctx context.Context, timeout time.Duration, c Check) error
 
-// runChecks runs the initial pass over checks, then up to cli.Retries further
+// runChecks runs the initial pass over checks, then up to cmd.Retries further
 // passes over the checks that failed with a retryable error, sleeping
-// cli.RetryDelay*2^(N-1) before pass N (skipped when the delay is 0). Any soft
+// cmd.RetryDelay*2^(N-1) before pass N (skipped when the delay is 0). Any soft
 // failure still failing after the last pass is alerted (reason "check failed
 // (after retries)") and counted. Returns the process exit code: 0 iff every
 // check ultimately passed. parseFailures pre-seeds the failure count and is
 // excluded from the success tally.
-func runChecks(ctx context.Context, cli CLI, checks []Check, parseFailures int,
+func runChecks(ctx context.Context, cmd CheckCmd, checks []Check, parseFailures int,
 	alerter Alerter, log *slog.Logger, checkFn checker) int {
 	var failures atomic.Int64
 	failures.Add(int64(parseFailures))
 
-	soft := runPass(ctx, cli, checks, checkFn, alerter, log, &failures)
-	for attempt := 1; attempt <= cli.Retries && len(soft) > 0; attempt++ {
-		if delay := cli.RetryDelay * time.Duration(1<<(attempt-1)); delay > 0 {
+	soft := runPass(ctx, cmd, checks, checkFn, alerter, log, &failures)
+	for attempt := 1; attempt <= cmd.Retries && len(soft) > 0; attempt++ {
+		if delay := cmd.RetryDelay * time.Duration(1<<(attempt-1)); delay > 0 {
 			time.Sleep(delay)
 		}
 		log.Debug("retry pass", "attempt", attempt, "pending", len(soft))
@@ -329,7 +383,7 @@ func runChecks(ctx context.Context, cli CLI, checks []Check, parseFailures int,
 		for i, sf := range soft {
 			retry[i] = sf.c
 		}
-		soft = runPass(ctx, cli, retry, checkFn, alerter, log, &failures)
+		soft = runPass(ctx, cmd, retry, checkFn, alerter, log, &failures)
 	}
 	for _, sf := range soft {
 		alerter.Alert(sf.c, "check failed (after retries)", sf.err)
@@ -348,11 +402,11 @@ func runChecks(ctx context.Context, cli CLI, checks []Check, parseFailures int,
 	return 0
 }
 
-// runPass runs every check in checks concurrently (bounded by cli.Concurrency).
+// runPass runs every check in checks concurrently (bounded by cmd.Concurrency).
 // A hard (non-retryable) failure is alerted and counted in failures at once;
 // a retryable failure is returned in the slice — not yet alerted or counted —
 // for the caller to retry. Successful checks are logged at debug.
-func runPass(ctx context.Context, cli CLI, checks []Check, checkFn checker,
+func runPass(ctx context.Context, cmd CheckCmd, checks []Check, checkFn checker,
 	alerter Alerter, log *slog.Logger, failures *atomic.Int64) []softFail {
 	var (
 		mu   sync.Mutex
@@ -360,10 +414,10 @@ func runPass(ctx context.Context, cli CLI, checks []Check, checkFn checker,
 	)
 	jobs := make(chan Check)
 	var wg sync.WaitGroup
-	for range cli.Concurrency {
+	for range cmd.Concurrency {
 		wg.Go(func() {
 			for c := range jobs {
-				err := checkFn(ctx, cli.Timeout, c)
+				err := checkFn(ctx, cmd.Timeout, c)
 				if err == nil {
 					log.Debug("ok", "hostname", c.Hostname, "ip", c.IP)
 					continue
