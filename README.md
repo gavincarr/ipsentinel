@@ -36,8 +36,9 @@ Only `-c`/`--config`, `--connect-default` and `-v`/`--verbose` are
 shared by all commands; they may go before or after the command name.
 The remaining flags (`-i`, `-s`/`--strip`, `-S`/`--strip-all`, `-C`,
 `-t`, `-r`, `--retry-delay`) belong to `check`: `ipsentinel check
---help` lists them, and they are rejected with `authorized-keys`.
-`known-hosts` also takes `-s` and `-S`, but only after its name.
+--help` lists them, and they are rejected with `authorized-keys` and
+`known-hosts`. `known-hosts` also takes `-s` and `-S`, but only after
+its name.
 
 `ipsentinel` reads `hostname,ip` pairs on stdin, one per line. Blank
 lines and lines beginning with `#` are ignored. Both IPv4 and IPv6
@@ -284,7 +285,7 @@ Known hosts
 -----------
 
 A `connect: ip` check looks the server's key up under the ip name, so
-until the ip has an entry in `known_hosts` it fails every host.
+until the ip has an entry in `known_hosts` it fails each such host.
 `ipsentinel known-hosts` prints the missing entries: for each
 `connect: ip` host on stdin, it copies the key(s) already trusted for
 the host under its usual name to the ip name (`[<ip>]:<port>`, or just
@@ -315,8 +316,21 @@ Things to know:
   isn't printed again, so a second run prints nothing new.
 - **Hosts with a `HostKeyAlias`** need nothing: ssh already looks the ip
   up under the alias, and they are skipped.
-- **The exit code is 1 if any host has a problem**, and nothing is
-  printed for that host. Each problem is logged:
+- **Revoked keys are never copied.** A key marked `@revoked` under the
+  host name (or the ip name) is dropped, so an explicit revocation can't
+  become fresh trust; only the surviving keys are printed.
+- **Per-file `%h` layouts are followed.** The host name is looked up in
+  the host's `UserKnownHostsFile`/`GlobalKnownHostsFile`, the ip name in
+  the ip's. When the user files differ (e.g. `~/.ssh/kh/%h`), a warning
+  `user known_hosts files differ between host and ip; ...` names the ip
+  side's first user file: the printed lines belong there, so
+  `>> ~/.ssh/known_hosts` may be wrong.
+- **No `connect: ip` hosts** in the input prints nothing and exits 0,
+  with the warning `no connect: ip hosts in input; nothing to do (did you
+  mean --connect-default ip?)`.
+- **The exit code is 1 if any host has a problem, or an input line is
+  malformed**, and nothing is printed for a problem host. Each problem is
+  logged:
   - `no known host key for host; add it by hand, see README`: no key
     is recorded under the host's usual name, so there is nothing to
     copy. Use the manual steps under [`connect: ip`](#connect-ip).
@@ -324,7 +338,9 @@ Things to know:
     already holds a key that isn't one of the host's. Investigate
     before doing anything else (the ip may reach a different machine,
     or the host's key may have rotated); don't override it blindly.
-  - Others: `ssh -G failed` for the host, or an unreadable
+  - `host key revoked for host; not adding`: every key found for the
+    host is revoked, under its name or the ip name.
+  - Others: `ssh -G failed` (the `side` attribute says `ip` or `host`), or an unreadable
     `known_hosts` file (`looking up host key failed`), which is reported
     rather than skipped so it can't hide a key.
 
