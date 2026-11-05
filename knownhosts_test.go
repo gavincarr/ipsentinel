@@ -48,25 +48,27 @@ func TestParseKeygenFind(t *testing.T) {
 		name string
 		out  string
 		want []hostKey
+		rev  []hostKey
 	}{
-		{"empty", "", nil},
+		{"empty", "", nil, nil},
 		{"plain", "# Host [web1]:2222 found: line 1 \n[web1]:2222 " + keyA + "\n",
-			[]hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}}},
+			[]hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}}, nil},
 		{"hashed", "# Host web1 found: line 3 \n|1|c2FsdA==|aGFzaA== " + keyB + "\n",
-			[]hostKey{{"ssh-ed25519", strings.Fields(keyB)[1]}}},
-		{"revoked and cert-authority skipped",
+			[]hostKey{{"ssh-ed25519", strings.Fields(keyB)[1]}}, nil},
+		{"revoked returned separately, cert-authority skipped",
 			"# Host h found: line 1\n@revoked h " + keyA + "\n# Host h found: line 2\n@cert-authority h " + keyB + "\n",
-			nil},
+			nil, []hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}}},
 		{"trailing comment ignored", "h " + keyA + " root@box\n",
-			[]hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}}},
+			[]hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}}, nil},
 		{"blank lines and dupes", "\nh " + keyA + "\n\nh " + keyA + " again\nh " + keyRSA + "\n",
-			[]hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}, {"ssh-rsa", strings.Fields(keyRSA)[1]}}},
-		{"short line skipped", "h ssh-ed25519\n", nil},
+			[]hostKey{{"ssh-ed25519", strings.Fields(keyA)[1]}, {"ssh-rsa", strings.Fields(keyRSA)[1]}}, nil},
+		{"short line skipped", "h ssh-ed25519\n", nil, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := parseKeygenFind(tt.out); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseKeygenFind = %v, want %v", got, tt.want)
+			got, rev := parseKeygenFind(tt.out)
+			if !reflect.DeepEqual(got, tt.want) || !reflect.DeepEqual(rev, tt.rev) {
+				t.Errorf("parseKeygenFind = %v, %v; want %v, %v", got, rev, tt.want, tt.rev)
 			}
 		})
 	}
@@ -106,8 +108,11 @@ type fakeSSH struct {
 	hostPort string // port in host-side config; "" means 22
 	ipPort   string // port in ip-side config; "" means 22
 	hash     bool
-	alias    string
+	alias    string   // HostKeyAlias in the ip-side config
+	hostAl   string   // HostKeyAlias in the host-side config
 	files    []string // user known_hosts files; the global list is empty
+	hostFile []string // host-side user files; nil means the same as files
+	none     bool     // user and global lists are both the literal "none"
 	err      error
 }
 
@@ -121,15 +126,28 @@ func (f fakeSSH) config(_ context.Context, hostname, ip string) (string, error) 
 		}
 		return p
 	}
+	user, global := strings.Join(f.files, " "), "/nonexistent/ssh_known_hosts"
+	if f.none {
+		user, global = "none", "none"
+	}
 	if ip == "" {
-		return "hostname " + hostname + "\nport " + port(f.hostPort) + "\n", nil
+		hu := user
+		if f.hostFile != nil {
+			hu = strings.Join(f.hostFile, " ")
+		}
+		out := "hostname " + hostname + "\nport " + port(f.hostPort) + "\n" +
+			"userknownhostsfile " + hu + "\nglobalknownhostsfile " + global + "\n"
+		if f.hostAl != "" {
+			out += "hostkeyalias " + f.hostAl + "\n"
+		}
+		return out, nil
 	}
 	hash := "no"
 	if f.hash {
 		hash = "yes"
 	}
 	out := "hostname " + ip + "\nport " + port(f.ipPort) + "\nhashknownhosts " + hash + "\n" +
-		"userknownhostsfile " + strings.Join(f.files, " ") + "\nglobalknownhostsfile /nonexistent/ssh_known_hosts\n"
+		"userknownhostsfile " + user + "\nglobalknownhostsfile " + global + "\n"
 	if f.alias != "" {
 		out += "hostkeyalias " + f.alias + "\n"
 	}
@@ -217,6 +235,33 @@ func TestRunKnownHosts(t *testing.T) {
 			known:    "@revoked web1 " + keyA + "\n",
 			wantCode: 1,
 			wantLog:  []string{"no known host key for host"}},
+		{name: "key revoked for host is not copied", input: in1,
+			known:    "web1 " + keyA + "\n@revoked web1 " + keyA + "\n",
+			wantCode: 1,
+			wantLog:  []string{"host key revoked for host; not adding", "hostname=web1", "ip=192.0.2.1", "name=web1"}},
+		{name: "only the unrevoked key is copied", input: in1,
+			known:   "web1 " + keyA + "\nweb1 " + keyB + "\n@revoked web1 " + keyA + "\n",
+			wantOut: "192.0.2.1 " + keyB + "\n"},
+		{name: "key revoked under the ip name is not printed", input: in1,
+			known:   "web1 " + keyA + "\nweb1 " + keyB + "\n@revoked 192.0.2.1 " + keyA + "\n",
+			wantOut: "192.0.2.1 " + keyB + "\n"},
+		{name: "all keys revoked under the ip name", input: in1,
+			known:    "web1 " + keyA + "\n@revoked 192.0.2.1 " + keyA + "\n",
+			wantCode: 1,
+			wantLog:  []string{"host key revoked for host; not adding"}},
+		{name: "host-side hostkeyalias is the lookup name", input: in1,
+			known:   "shared " + keyA + "\n",
+			ssh:     fakeSSH{hostAl: "shared", hostPort: "2222", ipPort: "2222"},
+			wantOut: "[192.0.2.1]:2222 " + keyA + "\n"},
+		{name: "no connect: ip hosts warns", input: in1,
+			known:   "web1 " + keyA + "\n",
+			config:  Config{ConnectDefault: connectSSHConfig},
+			wantLog: []string{"level=WARN", "no connect: ip hosts in input; nothing to do (did you mean --connect-default ip?)"}},
+		{name: "ssh -G failure on ip side", input: in1,
+			known:    "web1 " + keyA + "\n",
+			ssh:      fakeSSH{err: errors.New("boom")},
+			wantCode: 1,
+			wantLog:  []string{"ssh -G failed", "side=ip"}},
 		{name: "hostkeyalias set is skipped", input: in1,
 			known:      "web1 " + keyA + "\n",
 			ssh:        fakeSSH{alias: "shared"},
@@ -342,10 +387,67 @@ func TestFindKeysStatError(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
 	missing := filepath.Join(t.TempDir(), "absent")
-	if keys, err := findKeys(context.Background(), realKnownHostsEnv(), "web1", []string{missing}); err != nil || keys != nil {
+	if keys, _, err := findKeys(context.Background(), realKnownHostsEnv(), "web1", []string{missing}); err != nil || keys != nil {
 		t.Errorf("missing file: keys = %v, err = %v; want nil, nil", keys, err)
 	}
-	if _, err := findKeys(context.Background(), realKnownHostsEnv(), "web1", []string{file}); err == nil {
+	if _, _, err := findKeys(context.Background(), realKnownHostsEnv(), "web1", []string{file}); err == nil {
 		t.Error("unreadable file: err = nil, want an error")
+	}
+}
+
+// TestRunKnownHostsPerSideFiles checks the %h-style layout where the host
+// and ip names expand to different user known_hosts files: the host name is
+// looked up in the host side's file, the ip name in the ip side's, and a Warn
+// says where the printed lines belong.
+func TestRunKnownHostsPerSideFiles(t *testing.T) {
+	needKeygen(t)
+	hostFile := writeKnownHosts(t, "web1 "+keyA+"\n")
+	ipFile := writeKnownHosts(t, "192.0.2.1 "+keyA+"\n"+"192.0.2.1 "+keyRSA+"\n")
+	f := fakeSSH{files: []string{ipFile}, hostFile: []string{hostFile}}
+	env := realKnownHostsEnv()
+	env.sshConfig, env.salt = f.config, testSalt
+	var stdout, logbuf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logbuf, nil))
+	code := runKnownHosts(strings.NewReader("web1,192.0.2.1\n"), false, "", Config{ConnectDefault: connectIP}, log, &stdout, env)
+	// The ip file holds a key that is not the host's: only reachable if the
+	// ip name was looked up in the ip side's file.
+	if code != 1 || !strings.Contains(logbuf.String(), "ip already has a different host key") {
+		t.Errorf("code = %d, want 1 with a foreign-key error\nlog:\n%s", code, logbuf.String())
+	}
+	if !strings.Contains(logbuf.String(), "level=WARN") || !strings.Contains(logbuf.String(), "file="+ipFile) {
+		t.Errorf("log missing the user-files Warn naming %s:\n%s", ipFile, logbuf.String())
+	}
+
+	// Without the foreign key, the host key is found in the host side's file
+	// only, and printed.
+	ipFile2 := writeKnownHosts(t, "")
+	f = fakeSSH{files: []string{ipFile2}, hostFile: []string{hostFile}}
+	env.sshConfig = f.config
+	stdout.Reset()
+	logbuf.Reset()
+	code = runKnownHosts(strings.NewReader("web1,192.0.2.1\n"), false, "", Config{ConnectDefault: connectIP}, log, &stdout, env)
+	if code != 0 || stdout.String() != "192.0.2.1 "+keyA+"\n" {
+		t.Errorf("code = %d, stdout = %q\nlog:\n%s", code, stdout.String(), logbuf.String())
+	}
+}
+
+// TestRunKnownHostsNoneFiles checks that the literal "none" ssh -G prints
+// for a disabled known_hosts list is dropped, not treated as a relative file
+// called none (which is made to exist here, holding the host's key).
+func TestRunKnownHostsNoneFiles(t *testing.T) {
+	needKeygen(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "none"), []byte("web1 "+keyA+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	f := fakeSSH{none: true}
+	env := realKnownHostsEnv()
+	env.sshConfig, env.salt = f.config, testSalt
+	var stdout, logbuf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logbuf, nil))
+	code := runKnownHosts(strings.NewReader("web1,192.0.2.1\n"), false, "", Config{ConnectDefault: connectIP}, log, &stdout, env)
+	if code != 1 || stdout.String() != "" || !strings.Contains(logbuf.String(), "no known host key for host") {
+		t.Errorf("code = %d, stdout = %q\nlog:\n%s", code, stdout.String(), logbuf.String())
 	}
 }
