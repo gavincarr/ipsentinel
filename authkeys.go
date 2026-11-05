@@ -1,6 +1,8 @@
 // The authorized-keys command: instead of running checks, generate OpenSSH
 // authorized_keys lines that force the monitoring key to run exactly the
-// command ipsentinel would send each host (or each check variant).
+// command ipsentinel would send each host (or each check variant). The
+// forced command depends only on a host's check; connect changes only the
+// ssh options on the monitoring side.
 package main
 
 import (
@@ -29,8 +31,8 @@ import (
 func forcedCommand(c Check) (string, error) {
 	flat := strings.Join(strings.Split(remoteCommand(c), "\n"), "; ")
 	if strings.Contains(flat, `\`) {
-		return "", fmt.Errorf("remote command for type %s contains a backslash, which cannot be safely quoted for authorized_keys: %q",
-			c.Type, flat)
+		return "", fmt.Errorf("remote command for check %s contains a backslash, which cannot be safely quoted for authorized_keys: %q",
+			c.CheckName, flat)
 	}
 	return strings.ReplaceAll(flat, `"`, `\"`), nil
 }
@@ -150,44 +152,43 @@ func writeTable(w io.Writer, rows []akRow) error {
 	return nil
 }
 
-// variantTypeOrder is the preferred display order of check types in variant
-// mode. Types in checkCommands but missing here still appear, sorted, after
-// these, so a new type can never be silently left out.
-var variantTypeOrder = []string{"iproute2", "connect", "aws", "ifconfig"}
+// variantCheckOrder is the preferred display order of checks in variant
+// mode. Checks in checkCommands but missing here still appear, sorted, after
+// these, so a new check can never be silently left out.
+var variantCheckOrder = []string{"iproute2", "aws", "ifconfig", checkNone}
 
-// checkVariants returns every check type in checkCommands, in display order
-// (see variantTypeOrder). Each type is one variant: its name is the row
-// label, and its forced command that of Check{Type: name}.
+// checkVariants returns every check in checkCommands, in display order (see
+// variantCheckOrder). Each check is one variant: its name is the row label,
+// and its forced command that of Check{CheckName: name}.
 func checkVariants() []string {
-	var types []string
-	for _, t := range variantTypeOrder {
-		if _, ok := checkCommands[t]; ok {
-			types = append(types, t)
+	var names []string
+	for _, n := range variantCheckOrder {
+		if _, ok := checkCommands[n]; ok {
+			names = append(names, n)
 		}
 	}
-	for _, t := range slices.Sorted(maps.Keys(checkCommands)) {
-		if !slices.Contains(types, t) {
-			types = append(types, t)
+	for _, n := range slices.Sorted(maps.Keys(checkCommands)) {
+		if !slices.Contains(names, n) {
+			names = append(names, n)
 		}
 	}
-	return types
+	return names
 }
 
 // resolveHost builds the Check for host (labelled exactly as given; no
 // stripping) from config. An exact config key wins. Otherwise the keys
 // starting with host+"." are candidates, so a short name like web1 finds
-// web1.example.com: none means host isn't configured (default type); one is
-// used; several are fine only if they all yield the same forced command,
-// else it's an error naming each candidate and its type.
-func resolveHost(host string, config map[string]HostConfig) (Check, error) {
-	mk := func(hc HostConfig) Check {
-		return Check{Hostname: host, Type: hc.checkType()}
-	}
-	if hc, ok := config[host]; ok {
+// web1.example.com: none means host isn't configured (defaults); one is
+// used; several are fine only if they all yield the same forced command
+// (their connect modes may differ, as connect doesn't affect it), else it's
+// an error naming each candidate and its check.
+func resolveHost(host string, config Config) (Check, error) {
+	mk := func(hc HostConfig) Check { return config.check(host, hc) }
+	if hc, ok := config.Hosts[host]; ok {
 		return mk(hc), nil
 	}
 	var keys []string
-	for k := range config {
+	for k := range config.Hosts {
 		if strings.HasPrefix(k, host+".") {
 			keys = append(keys, k)
 		}
@@ -196,15 +197,15 @@ func resolveHost(host string, config map[string]HostConfig) (Check, error) {
 	if len(keys) == 0 {
 		return mk(HostConfig{}), nil
 	}
-	c := mk(config[keys[0]])
+	c := mk(config.Hosts[keys[0]])
 	want := remoteCommand(c)
 	for _, k := range keys[1:] {
-		if remoteCommand(mk(config[k])) != want {
+		if remoteCommand(mk(config.Hosts[k])) != want {
 			descs := make([]string, len(keys))
 			for i, k := range keys {
-				descs[i] = k + " (" + mk(config[k]).Type + ")"
+				descs[i] = k + " (" + mk(config.Hosts[k]).CheckName + ")"
 			}
-			return Check{}, fmt.Errorf("ambiguous: matches config entries with different check types: %s",
+			return Check{}, fmt.Errorf("ambiguous: matches config entries with different checks: %s",
 				strings.Join(descs, ", "))
 		}
 	}
@@ -220,7 +221,7 @@ func resolveHost(host string, config map[string]HostConfig) (Check, error) {
 // (see checkVariants), ignoring config. A missing --from (or IPSENTINEL_FROM) is warned about,
 // since the lines then accept the key from anywhere. Returns the exit code:
 // 1 if any host was skipped, else 0.
-func runAuthorizedKeys(hosts []string, config map[string]HostConfig, log *slog.Logger,
+func runAuthorizedKeys(hosts []string, config Config, log *slog.Logger,
 	w io.Writer, pubkey string, from []string) int {
 	if len(from) == 0 {
 		log.Warn("no --from or IPSENTINEL_FROM given; generated lines allow the key from any address")
@@ -239,8 +240,8 @@ func runAuthorizedKeys(hosts []string, config map[string]HostConfig, log *slog.L
 	}
 
 	if len(hosts) == 0 {
-		for _, t := range checkVariants() {
-			add(t, Check{Type: t})
+		for _, n := range checkVariants() {
+			add(n, Check{CheckName: n})
 		}
 	} else {
 		seen := make(map[string]bool)
@@ -256,7 +257,7 @@ func runAuthorizedKeys(hosts []string, config map[string]HostConfig, log *slog.L
 			}
 			c, err := resolveHost(host, config)
 			if err != nil {
-				log.Error("cannot resolve check type; skipping", "host", host, "err", err)
+				log.Error("cannot resolve check; skipping", "host", host, "err", err)
 				skipped++
 				continue
 			}

@@ -1,8 +1,11 @@
 // Command ipsentinel reads hostname,ip pairs on stdin, runs
 // `ssh <hostname> ip address` for each (honouring ~/.ssh/config), and confirms
-// the ip is still present in that output (or, for connect checks, that ssh to
-// the ip itself succeeds with the host's key). Any failure — ssh error,
-// timeout, or a missing ip — is posted to an Alerter for attention.
+// the ip is still present in that output. Per-host config can change how ssh
+// reaches the host (connect: ssh_config, or ip to dial the expected ip itself
+// so the verified host key proves it reaches the host) and what is checked
+// (check: iproute2, aws, ifconfig, or none to pass on ssh success alone, with
+// connect: ip). Any failure — ssh error, timeout, or a missing ip — is posted
+// to an Alerter for attention.
 package main
 
 import (
@@ -32,8 +35,9 @@ import (
 // CLI holds the command-line configuration. The root flags are shared by
 // every command; the per-command settings live on the command structs.
 type CLI struct {
-	Config  string `kong:"name='config',short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
-	Verbose int    `kong:"name='verbose',short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
+	Config         string `kong:"name='config',short='c',placeholder='PATH',help='Path to a YAML config file mapping hostnames to per-host settings (see README).'"`
+	ConnectDefault string `kong:"name='connect-default',enum='ip,ssh_config',default='ssh_config',help='Connect mode for hosts that do not set connect in the config file (including hosts with no entry): ssh_config or ip. Mainly for trying connect: ip across all hosts before changing anything per host.'"`
+	Verbose        int    `kong:"name='verbose',short='v',type='counter',help='Increase verbosity: absent prints only warnings and alerts, -v adds run progress, -vv adds per-check detail.'"`
 
 	// check is the default command, and "withargs" lets its flags be given
 	// without naming it, so `ipsentinel -i KEY -c CFG -s DOMAIN < hosts`
@@ -86,9 +90,10 @@ func (a *AuthorizedKeysCmd) AfterApply(kctx *kong.Context) error {
 
 // Check is a single hostname,ip pair to verify.
 type Check struct {
-	Hostname string
-	IP       string
-	Type     string // check type: a checkCommands key, resolved by parseInput
+	Hostname  string
+	IP        string
+	Connect   string // connect mode: a connectModes value, resolved by parseInput
+	CheckName string // check: a checkCommands key, resolved by parseInput
 }
 
 // validHostname guards against argv flag smuggling: a hostname read from stdin
@@ -189,10 +194,10 @@ func main() {
 	cli.Check.Concurrency = max(cli.Check.Concurrency, 1)
 	cli.Check.Retries = max(cli.Check.Retries, 0)
 
-	var config map[string]HostConfig
+	config := Config{ConnectDefault: cli.ConnectDefault}
 	if cli.Config != "" {
 		var err error
-		config, err = loadConfig(cli.Config)
+		config, err = loadConfig(cli.Config, cli.ConnectDefault)
 		if err != nil {
 			log.Error("loading config", "err", err)
 			os.Exit(1)
@@ -228,7 +233,7 @@ func main() {
 
 // run reads checks from r, runs them (with retries for transient failures),
 // and returns the process exit code (0 = all passed, 1 = one or more failures).
-func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) int {
+func run(cli CLI, config Config, log *slog.Logger, r io.Reader) int {
 	alerter := LogAlerter{log: log}
 
 	checks, parseFailures := parseInput(r, alerter, cli.Check.StripAll, cli.Check.Strip, config)
@@ -247,10 +252,10 @@ func run(cli CLI, config map[string]HostConfig, log *slog.Logger, r io.Reader) i
 // failure count. Each ip is parsed and stored in its canonical text form. When
 // domain is non-empty, that suffix is stripped from each validated hostname
 // (see stripDomain); when stripAll is set, the hostname is then reduced to its
-// leftmost DNS label (see stripHostname). Each check's Type is resolved from
-// config — keyed by the unstripped hostname — before any stripping, defaulting
-// to defaultCheckType for absent hosts or empty types.
-func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, config map[string]HostConfig) ([]Check, int) {
+// leftmost DNS label (see stripHostname). Each check's Connect and CheckName
+// are resolved from config — keyed by the unstripped hostname — before any
+// stripping (see Config.check for the defaults).
+func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, config Config) ([]Check, int) {
 	var checks []Check
 	var failures int
 
@@ -282,16 +287,18 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 		// Store the canonical text form so matching against `ip address`
 		// output is spelling-insensitive (e.g. FE80::1 => fe80::1).
 		ip = addr.String()
-		// Resolve the check type before stripping: config is keyed by the
-		// hostname as it appears on stdin.
-		hc := config[host] // zero value (default type) when absent
+		// Look up the host's settings before stripping: config is keyed by
+		// the hostname as it appears on stdin.
+		hc := config.Hosts[host] // zero value (defaults) when absent
 		if domain != "" {
 			host = stripDomain(host, domain)
 		}
 		if stripAll {
 			host = stripHostname(host)
 		}
-		checks = append(checks, Check{Hostname: host, IP: ip, Type: hc.checkType()})
+		c := config.check(host, hc)
+		c.IP = ip
+		checks = append(checks, c)
 	}
 	if err := sc.Err(); err != nil {
 		alerter.Alert(Check{}, "error reading stdin", err)
@@ -300,21 +307,22 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 	return checks, failures
 }
 
-// sshArgs builds the ssh argv for c: batch-mode options, the target host,
-// and the remote command for the check's type (see remoteCommand).
+// sshArgs builds the ssh argv for c: batch-mode options, a HostName override
+// for connect: ip, the target host, and the remote command for c's check (see
+// remoteCommand).
 func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds),
 	}
-	// A connect check dials the expected IP itself rather than whatever the
-	// alias resolves to. A command-line -o overrides ~/.ssh/config only for
+	// connect: ip dials the expected IP itself rather than whatever the
+	// alias resolves to, whatever the check. A command-line -o overrides ~/.ssh/config only for
 	// the option given, so Port, User, IdentityFile etc. still come from the
 	// alias's config; and the host key is still verified (under BatchMode an
 	// unknown or changed key fails), which is what proves the IP still
 	// reaches this host. c.IP is safe in argv: parseInput validated and
 	// canonicalised it with netip, and IPv6 needs no brackets here.
-	if c.Type == "connect" {
+	if c.Connect == connectIP {
 		args = append(args, "-o", "HostName="+c.IP)
 	}
 	// A forced identity pins ssh to this one key. IdentitiesOnly=yes stops it
@@ -327,16 +335,16 @@ func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
 	return append(args, "--", c.Hostname, remoteCommand(c))
 }
 
-// remoteCommand returns the shell command run on the target for c's check
-// type. It is the single source of truth shared by the check path (sshArgs)
-// and the authorized-keys path (forcedCommand), so a host's forced command is
-// always exactly what ipsentinel sends it. Unknown or empty types fall back
-// to the default.
+// remoteCommand returns the shell command run on the target for c's check.
+// It is the single source of truth shared by the check path (sshArgs) and the
+// authorized-keys path (forcedCommand), so a host's forced command is always
+// exactly what ipsentinel sends it. It depends only on the check, never the
+// connect mode. Unknown or empty checks fall back to the default.
 func remoteCommand(c Check) string {
-	if command, ok := checkCommands[c.Type]; ok {
+	if command, ok := checkCommands[c.CheckName]; ok {
 		return command
 	}
-	return checkCommands[defaultCheckType]
+	return checkCommands[defaultCheck]
 }
 
 // softErrorPatterns are the known-transient ssh failure signatures. A check
@@ -496,12 +504,14 @@ func runCheck(ctx context.Context, timeout time.Duration, c Check, identityFile 
 	return verifyOutput(c, string(out))
 }
 
-// verifyOutput checks the output of c's successful ssh run. A connect check
-// passes on the successful connection alone: its IP is a forwarded ingress
-// address that never appears on the target's interfaces, and the verified
-// host key is the proof. Every other type requires the expected ip in out.
+// verifyOutput checks the output of c's successful ssh run. check: none
+// passes on the successful connection alone: loadConfig guarantees it comes
+// with connect: ip, so ssh dialled the expected IP and the verified host key
+// is the proof (typically the IP is a forwarded ingress address that never
+// appears on the target's interfaces). Every other check requires the
+// expected ip in out, whatever the connect mode.
 func verifyOutput(c Check, out string) error {
-	if c.Type == "connect" {
+	if c.CheckName == checkNone {
 		return nil
 	}
 	if !ipPresent(out, c.IP) {

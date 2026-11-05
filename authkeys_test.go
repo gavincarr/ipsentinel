@@ -30,11 +30,12 @@ func TestForcedCommand(t *testing.T) {
 		c    Check
 		want string
 	}{
-		{"iproute2", Check{Type: "iproute2"}, "ip address"},
-		{"connect", Check{Type: "connect"}, "ip address"},
-		{"empty type defaults", Check{}, "ip address"},
-		{"ifconfig queries both families", Check{Type: "ifconfig"}, ifconfigForced},
-		{"aws", Check{Type: "aws"},
+		{"iproute2", Check{CheckName: "iproute2"}, "ip address"},
+		{"iproute2 with connect ip", Check{Connect: "ip", CheckName: "iproute2"}, "ip address"},
+		{"none", Check{Connect: "ip", CheckName: "none"}, "true"},
+		{"empty check defaults", Check{}, "ip address"},
+		{"ifconfig queries both families", Check{CheckName: "ifconfig"}, ifconfigForced},
+		{"aws", Check{CheckName: "aws"},
 			`ip address; ` +
 				`TOKEN=$(curl -sf -m 2 -X PUT -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\" http://169.254.169.254/latest/api/token 2>/dev/null) || true; ` +
 				`curl -sf -m 2 ${TOKEN:+-H \"X-aws-ec2-metadata-token: $TOKEN\"} http://169.254.169.254/latest/meta-data/public-ipv4 || true`},
@@ -55,7 +56,7 @@ func TestForcedCommand(t *testing.T) {
 // TestForcedCommandAWSQuoting pins the aws command's escaping: every double
 // quote escaped for sshd, and the shell expansions left for the remote shell.
 func TestForcedCommandAWSQuoting(t *testing.T) {
-	got, err := forcedCommand(Check{Type: "aws"})
+	got, err := forcedCommand(Check{CheckName: "aws"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,19 +78,14 @@ func TestForcedCommandAWSQuoting(t *testing.T) {
 // (which it refuses) or a newline (which would break the authorized_keys
 // line).
 func TestForcedCommandShippedCommandsQuotable(t *testing.T) {
-	checks := []Check{
-		{Type: "iproute2"},
-		{Type: "connect"},
-		{Type: "aws"},
-		{Type: "ifconfig"},
-	}
-	for _, c := range checks {
+	for name := range checkCommands {
+		c := Check{CheckName: name}
 		flat := strings.Join(strings.Split(remoteCommand(c), "\n"), "; ")
 		if strings.ContainsAny(flat, "\\\n\r") {
-			t.Errorf("%s: flattened command contains a backslash or newline: %q", c.Type, flat)
+			t.Errorf("%s: flattened command contains a backslash or newline: %q", name, flat)
 		}
 		if _, err := forcedCommand(c); err != nil {
-			t.Errorf("%s: forcedCommand: %v", c.Type, err)
+			t.Errorf("%s: forcedCommand: %v", name, err)
 		}
 	}
 }
@@ -99,7 +95,7 @@ func TestForcedCommandRejectsBackslash(t *testing.T) {
 	t.Cleanup(func() { checkCommands["iproute2"] = saved })
 	checkCommands["iproute2"] = `printf 'a\n'`
 
-	if got, err := forcedCommand(Check{Type: "iproute2"}); err == nil {
+	if got, err := forcedCommand(Check{CheckName: "iproute2"}); err == nil {
 		t.Errorf("forcedCommand with backslash = %q, want error", got)
 	}
 }
@@ -230,46 +226,50 @@ func akLog(buf *bytes.Buffer) *slog.Logger {
 }
 
 func TestResolveHost(t *testing.T) {
-	config := map[string]HostConfig{
-		"app":                {Type: "aws"},
-		"app.example.com":    {Type: "iproute2"},
-		"web1.example.com":   {Type: "aws"},
-		"facts.example.com":  {Type: "ifconfig"},
-		"db.example.com":     {Type: "aws"},
-		"db.example.net":     {Type: "aws"},
-		"mx.example.com":     {Type: "aws"},
-		"mx.example.net":     {Type: "iproute2"},
-		"ifc.example.com":    {Type: "ifconfig"},
-		"ifc.example.net":    {Type: "ifconfig"}, // one ifconfig command for all
-		"ifa.example.com":    {Type: "ifconfig"},
-		"ifa.example.net":    {Type: "aws"},
+	hosts := map[string]HostConfig{
+		"app":                {Check: "aws"},
+		"app.example.com":    {Check: "iproute2"},
+		"web1.example.com":   {Check: "aws"},
+		"facts.example.com":  {Check: "ifconfig"},
+		"db.example.com":     {Check: "aws"},
+		"db.example.net":     {Check: "aws"},
+		"mx.example.com":     {Check: "aws"},
+		"mx.example.net":     {Check: "iproute2"},
+		"ifc.example.com":    {Check: "ifconfig"},
+		"ifc.example.net":    {Check: "ifconfig"}, // one ifconfig command for all
+		"ifa.example.com":    {Check: "ifconfig"},
+		"ifa.example.net":    {Check: "aws"},
 		"dflt.example.com":   {},
-		"dflt.example.net":   {Type: "iproute2"}, // same as the default
-		"gitlab.example.com": {Type: "connect"},
-		"git.example.com":    {Type: "connect"},
-		"git.example.net":    {Type: "iproute2"}, // same command as connect
-		"gw.example.com":     {Type: "connect"},
-		"gw.example.net":     {Type: "aws"},
+		"dflt.example.net":   {Check: "iproute2"}, // same as the default
+		"gitlab.example.com": {Connect: "ip", Check: "none"},
+		"git.example.com":    {Connect: "ip", Check: "iproute2"},
+		"git.example.net":    {}, // connect differs, forced command doesn't
+		"gw.example.com":     {Connect: "ip", Check: "none"},
+		"gw.example.net":     {Connect: "ip", Check: "iproute2"},
+	}
+	config := Config{Hosts: hosts}
+	ck := func(host, connect, check string) Check {
+		return Check{Hostname: host, Connect: connect, CheckName: check}
 	}
 	tests := []struct {
 		host    string
 		want    Check
 		errWant []string // substrings; nil means success
 	}{
-		{"web1.example.com", Check{Hostname: "web1.example.com", Type: "aws"}, nil},
-		{"app", Check{Hostname: "app", Type: "aws"}, nil}, // exact match beats prefix
-		{"web1", Check{Hostname: "web1", Type: "aws"}, nil},
-		{"web1.example", Check{Hostname: "web1.example", Type: "aws"}, nil},
-		{"facts", Check{Hostname: "facts", Type: "ifconfig"}, nil},
-		{"ifc", Check{Hostname: "ifc", Type: "ifconfig"}, nil},
-		{"web", Check{Hostname: "web", Type: "iproute2"}, nil}, // prefix must end on a label
-		{"nothere", Check{Hostname: "nothere", Type: "iproute2"}, nil},
-		{"db", Check{Hostname: "db", Type: "aws"}, nil},
-		{"dflt", Check{Hostname: "dflt", Type: "iproute2"}, nil},
-		{"gitlab", Check{Hostname: "gitlab", Type: "connect"}, nil},
-		{"gitlab.example.com", Check{Hostname: "gitlab.example.com", Type: "connect"}, nil},
-		{"git", Check{Hostname: "git", Type: "connect"}, nil}, // connect and iproute2 share a command
-		{"gw", Check{}, []string{"gw.example.com (connect)", "gw.example.net (aws)"}},
+		{"web1.example.com", ck("web1.example.com", "ssh_config", "aws"), nil},
+		{"app", ck("app", "ssh_config", "aws"), nil}, // exact match beats prefix
+		{"web1", ck("web1", "ssh_config", "aws"), nil},
+		{"web1.example", ck("web1.example", "ssh_config", "aws"), nil},
+		{"facts", ck("facts", "ssh_config", "ifconfig"), nil},
+		{"ifc", ck("ifc", "ssh_config", "ifconfig"), nil},
+		{"web", ck("web", "ssh_config", "iproute2"), nil}, // prefix must end on a label
+		{"nothere", ck("nothere", "ssh_config", "iproute2"), nil},
+		{"db", ck("db", "ssh_config", "aws"), nil},
+		{"dflt", ck("dflt", "ssh_config", "iproute2"), nil},
+		{"gitlab", ck("gitlab", "ip", "none"), nil},
+		{"gitlab.example.com", ck("gitlab.example.com", "ip", "none"), nil},
+		{"git", ck("git", "ip", "iproute2"), nil}, // connect doesn't change the forced command
+		{"gw", Check{}, []string{"different checks", "gw.example.com (none)", "gw.example.net (iproute2)"}},
 		{"mx", Check{}, []string{"mx.example.com (aws)", "mx.example.net (iproute2)"}},
 		{"ifa", Check{}, []string{"ifa.example.com (ifconfig)", "ifa.example.net (aws)"}},
 	}
@@ -298,22 +298,23 @@ func TestResolveHost(t *testing.T) {
 }
 
 func TestRunAuthorizedKeysHosts(t *testing.T) {
-	aws, err := forcedCommand(Check{Type: "aws"})
+	aws, err := forcedCommand(Check{CheckName: "aws"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	line := func(forced string) string {
 		return `from="192.0.2.10",restrict,command="` + forced + `" ` + testPubkey
 	}
-	config := map[string]HostConfig{
-		"web1.example.com":   {Type: "aws"},
-		"facts.example.com":  {Type: "ifconfig"},
-		"db.example.com":     {Type: "aws"},
-		"db.example.net":     {Type: "aws"},
-		"mx.example.com":     {Type: "aws"},
-		"mx.example.net":     {Type: "iproute2"},
-		"gitlab.example.com": {Type: "connect"},
-	}
+	config := Config{Hosts: map[string]HostConfig{
+		"web1.example.com":   {Check: "aws"},
+		"facts.example.com":  {Check: "ifconfig"},
+		"db.example.com":     {Check: "aws"},
+		"db.example.net":     {Check: "aws"},
+		"mx.example.com":     {Check: "aws"},
+		"mx.example.net":     {Check: "iproute2"},
+		"gitlab.example.com": {Connect: "ip", Check: "none"},
+		"fwd.example.com":    {Connect: "ip", Check: "iproute2"},
+	}}
 
 	tests := []struct {
 		name       string
@@ -332,19 +333,25 @@ func TestRunAuthorizedKeysHosts(t *testing.T) {
 			wantExit: 0,
 		},
 		{
-			name:       "connect host gets the ip address forced command",
+			name:       "check none host gets the true forced command",
 			hosts:      []string{"gitlab", "web1"},
-			wantStdout: "gitlab  " + line("ip address") + "\n" + "web1    " + line(aws) + "\n",
+			wantStdout: "gitlab  " + line("true") + "\n" + "web1    " + line(aws) + "\n",
 			wantExit:   0,
 		},
 		{
-			name:       "ambiguous with one check type is fine",
+			name:       "connect ip with iproute2 gets the ip address forced command",
+			hosts:      []string{"fwd"},
+			wantStdout: "fwd  " + line("ip address") + "\n",
+			wantExit:   0,
+		},
+		{
+			name:       "ambiguous with one check is fine",
 			hosts:      []string{"db"},
 			wantStdout: "db  " + line(aws) + "\n",
 			wantExit:   0,
 		},
 		{
-			name:       "ambiguous with different types is skipped",
+			name:       "ambiguous with different checks is skipped",
 			hosts:      []string{"mx", "other"},
 			wantStdout: "other  " + line("ip address") + "\n",
 			wantStderr: []string{"level=ERROR", "host=mx", "mx.example.com (aws)", "mx.example.net (iproute2)", "skipped=1"},
@@ -396,7 +403,7 @@ func TestRunAuthorizedKeysHosts(t *testing.T) {
 func TestRunAuthorizedKeysVariants(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	// Config must be ignored in variant mode.
-	config := map[string]HostConfig{"iproute2": {Type: "aws"}}
+	config := Config{Hosts: map[string]HostConfig{"iproute2": {Check: "aws"}}}
 	exit := runAuthorizedKeys(nil, config, akLog(&stderr), &stdout, testPubkey, []string{"192.0.2.10"})
 	if exit != 0 {
 		t.Errorf("exit = %d, want 0; stderr:\n%s", exit, stderr.String())
@@ -405,7 +412,7 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 		t.Errorf("unexpected stderr:\n%s", stderr.String())
 	}
 
-	wantLabels := []string{"iproute2", "connect", "aws", "ifconfig"}
+	wantLabels := []string{"iproute2", "aws", "ifconfig", "none"}
 	rows := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
 	if len(rows) != len(wantLabels) {
 		t.Fatalf("got %d rows, want %d:\n%s", len(rows), len(wantLabels), stdout.String())
@@ -415,7 +422,7 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 		if label != wantLabels[i] {
 			t.Errorf("row %d label = %q, want %q", i, label, wantLabels[i])
 		}
-		forced, err := forcedCommand(Check{Type: wantLabels[i]})
+		forced, err := forcedCommand(Check{CheckName: wantLabels[i]})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -425,21 +432,21 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 	}
 }
 
-// TestCheckVariantsCoverCheckCommands guards against a new check type being
+// TestCheckVariantsCoverCheckCommands guards against a new check being
 // silently left out of variant mode, and against two variants sharing a
-// label. Forced commands may repeat: connect deliberately shares iproute2's.
+// label.
 func TestCheckVariantsCoverCheckCommands(t *testing.T) {
 	vs := checkVariants()
 	labels := make(map[string]bool)
 	for _, v := range vs {
 		labels[v] = true
-		if _, err := forcedCommand(Check{Type: v}); err != nil {
+		if _, err := forcedCommand(Check{CheckName: v}); err != nil {
 			t.Fatalf("%s: %v", v, err)
 		}
 	}
-	for typ := range checkCommands {
-		if !labels[typ] {
-			t.Errorf("check type %q missing from checkVariants", typ)
+	for name := range checkCommands {
+		if !labels[name] {
+			t.Errorf("check %q missing from checkVariants", name)
 		}
 	}
 	if len(vs) != len(labels) {
@@ -502,7 +509,7 @@ func TestRunAuthorizedKeysFromWarning(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, hosts := range [][]string{nil, {"web1"}} {
 				var stdout, stderr bytes.Buffer
-				exit := runAuthorizedKeys(hosts, nil, akLog(&stderr), &stdout, testPubkey, tt.from)
+				exit := runAuthorizedKeys(hosts, Config{}, akLog(&stderr), &stdout, testPubkey, tt.from)
 				if exit != 0 {
 					t.Errorf("hosts %q: exit = %d, want 0", hosts, exit)
 				}
@@ -535,7 +542,7 @@ func TestCLIGrammar(t *testing.T) {
 		akCmd      = "authorized-keys <pubkey>"
 		akHostsCmd = "authorized-keys <pubkey> <host>"
 	)
-	defaults := CLI{Check: CheckCmd{Concurrency: 8, Timeout: 10 * time.Second, Retries: 2, RetryDelay: 5 * time.Second}}
+	defaults := CLI{ConnectDefault: "ssh_config", Check: CheckCmd{Concurrency: 8, Timeout: 10 * time.Second, Retries: 2, RetryDelay: 5 * time.Second}}
 	with := func(f func(*CLI)) CLI {
 		c := defaults
 		f(&c)
@@ -597,6 +604,23 @@ func TestCLIGrammar(t *testing.T) {
 				c.Verbose = 1
 				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "k.pub", Hosts: []string{"h"}}
 			}), akHostsCmd},
+		{"connect-default before implicit check", []string{"--connect-default=ip", "-c", "cfg"},
+			with(func(c *CLI) { c.ConnectDefault = "ip"; c.Config = "cfg" }), checkCmd},
+		{"connect-default before check", []string{"--connect-default", "ip", "check", "-i", "k"},
+			with(func(c *CLI) { c.ConnectDefault = "ip"; c.Check.Identity = "k" }), checkCmd},
+		{"connect-default after check", []string{"check", "--connect-default=ip"},
+			with(func(c *CLI) { c.ConnectDefault = "ip" }), checkCmd},
+		{"connect-default explicit ssh_config", []string{"--connect-default=ssh_config"}, defaults, checkCmd},
+		{"connect-default before authorized-keys", []string{"--connect-default=ip", "authorized-keys", "k.pub", "h"},
+			with(func(c *CLI) {
+				c.ConnectDefault = "ip"
+				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "k.pub", Hosts: []string{"h"}}
+			}), akHostsCmd},
+		{"connect-default after authorized-keys", []string{"authorized-keys", "--connect-default", "ip", "k.pub"},
+			with(func(c *CLI) {
+				c.ConnectDefault = "ip"
+				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "k.pub"}
+			}), akCmd},
 		{"authorized-keys from equals", []string{"authorized-keys", "--from=192.0.2.10,!10.0.0.1", "/root/.ssh/id_ipsentinel.pub"},
 			with(func(c *CLI) {
 				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "/root/.ssh/id_ipsentinel.pub", From: "192.0.2.10,!10.0.0.1"}
@@ -629,7 +653,8 @@ func TestCLIGrammar(t *testing.T) {
 
 // TestCLIGrammarErrors pins argv kong must reject: check-only flags
 // (including -s/-S) are scoped away from authorized-keys, PUBKEY is
-// required, and --from is only valid under authorized-keys.
+// required, --from is only valid under authorized-keys, and
+// --connect-default takes only ip or ssh_config.
 func TestCLIGrammarErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -647,6 +672,10 @@ func TestCLIGrammarErrors(t *testing.T) {
 		{"strip xor strip-all", []string{"-s", "example.com", "-S"}},
 		{"check strip xor strip-all", []string{"check", "-s", "example.com", "-S"}},
 		{"old authorized-keys flag", []string{"--authorized-keys=k.pub"}},
+		{"connect-default invalid", []string{"--connect-default=dns"}},
+		{"connect-default empty", []string{"--connect-default="}},
+		{"connect-default invalid under authorized-keys", []string{"authorized-keys", "--connect-default=connect", "k.pub"}},
+		{"old default-connect spelling", []string{"--default-connect=ip"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

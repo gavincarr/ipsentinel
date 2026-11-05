@@ -47,12 +47,12 @@ func TestParseInput(t *testing.T) {
 	}, "\n")
 
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", nil)
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", Config{})
 
 	wantChecks := []Check{
-		{"host1", "10.0.0.1", "iproute2"},
-		{"host2", "10.0.0.2", "iproute2"},
-		{"sub.host_alias-1.example.com", "10.0.0.7", "iproute2"},
+		{"host1", "10.0.0.1", "ssh_config", "iproute2"},
+		{"host2", "10.0.0.2", "ssh_config", "iproute2"},
+		{"sub.host_alias-1.example.com", "10.0.0.7", "ssh_config", "iproute2"},
 	}
 	if len(checks) != len(wantChecks) {
 		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(wantChecks), checks)
@@ -76,7 +76,7 @@ func TestParseInput(t *testing.T) {
 
 func TestParseInputRejectsFlagSmuggling(t *testing.T) {
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false, "", nil)
+	checks, failures := parseInput(strings.NewReader("-oProxyCommand=evil,10.0.0.1\n"), &alerter, false, "", Config{})
 
 	if len(checks) != 0 {
 		t.Fatalf("flag-smuggling host was accepted as a check: %+v", checks)
@@ -110,8 +110,8 @@ func TestParseInputStrip(t *testing.T) {
 
 	// stripAll=true reduces each validated hostname to its leftmost label.
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", nil)
-	wantStripped := []Check{{"foo", "10.0.0.1", "iproute2"}, {"bar", "10.0.0.2", "iproute2"}}
+	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", Config{})
+	wantStripped := []Check{{"foo", "10.0.0.1", "ssh_config", "iproute2"}, {"bar", "10.0.0.2", "ssh_config", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -126,7 +126,7 @@ func TestParseInputStrip(t *testing.T) {
 
 	// stripAll=false leaves the hostname untouched (existing behaviour).
 	var alerter2 captureAlerter
-	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", nil)
+	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", Config{})
 	if checks[0].Hostname != "foo.example.com" {
 		t.Errorf("stripAll=false altered hostname: got %q, want %q", checks[0].Hostname, "foo.example.com")
 	}
@@ -155,8 +155,8 @@ func TestParseInputStripDomain(t *testing.T) {
 
 	// domain suffix is stripped only where it matches; other hosts pass through.
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com", nil)
-	want := []Check{{"foo", "10.0.0.1", "iproute2"}, {"bar.other.com", "10.0.0.2", "iproute2"}, {"baz", "10.0.0.3", "iproute2"}}
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com", Config{})
+	want := []Check{{"foo", "10.0.0.1", "ssh_config", "iproute2"}, {"bar.other.com", "10.0.0.2", "ssh_config", "iproute2"}, {"baz", "10.0.0.3", "ssh_config", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -181,12 +181,12 @@ func TestParseInputValidatesIP(t *testing.T) {
 	}, "\n")
 
 	var alerter captureAlerter
-	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", nil)
+	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", Config{})
 
 	want := []Check{
-		{"host1", "10.0.0.1", "iproute2"},
-		{"host5", "fe80::1", "iproute2"},
-		{"host6", "fe80::1", "iproute2"},
+		{"host1", "10.0.0.1", "ssh_config", "iproute2"},
+		{"host5", "fe80::1", "ssh_config", "iproute2"},
+		{"host6", "fe80::1", "ssh_config", "iproute2"},
 	}
 	if failures != 3 {
 		t.Errorf("got %d failures, want 3", failures)
@@ -234,44 +234,60 @@ func TestIPPresent(t *testing.T) {
 	}
 }
 
-func TestParseInputConfigTypes(t *testing.T) {
-	input := "foo.example.com,10.0.0.1\nbar.example.com,10.0.0.2\n"
-	config := map[string]HostConfig{
-		"foo.example.com": {Type: "aws"}, // keyed by unstripped hostname
-	}
+func TestParseInputConfig(t *testing.T) {
+	input := "foo.example.com,10.0.0.1\nbar.example.com,10.0.0.2\ngw.example.com,10.0.0.3\n"
+	config := Config{Hosts: map[string]HostConfig{
+		"foo.example.com": {Check: "aws"}, // keyed by unstripped hostname
+		"gw.example.com":  {Connect: "ip", Check: "none"},
+	}}
 
 	// The config lookup uses the hostname as read from stdin, even when
 	// stripping rewrites what is stored on the Check.
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", config)
-	want := []Check{{"foo", "10.0.0.1", "aws"}, {"bar", "10.0.0.2", "iproute2"}}
+	want := []Check{
+		{"foo", "10.0.0.1", "ssh_config", "aws"},
+		{"bar", "10.0.0.2", "ssh_config", "iproute2"},
+		{"gw", "10.0.0.3", "ip", "none"},
+	}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
-	if len(checks) != len(want) {
-		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(want), checks)
-	}
-	for i, w := range want {
-		if checks[i] != w {
-			t.Errorf("check[%d] = %+v, want %+v", i, checks[i], w)
-		}
+	if !slices.Equal(checks, want) {
+		t.Errorf("checks = %+v, want %+v", checks, want)
 	}
 
-	// A nil config defaults every check to iproute2.
+	// A zero Config defaults every check to ssh_config + iproute2.
 	var alerter2 captureAlerter
-	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", nil)
+	checks, _ = parseInput(strings.NewReader(input), &alerter2, false, "", Config{})
 	for i, c := range checks {
-		if c.Type != "iproute2" {
-			t.Errorf("nil-config check[%d].Type = %q, want %q", i, c.Type, "iproute2")
+		if c.Connect != "ssh_config" || c.CheckName != "iproute2" {
+			t.Errorf("zero-config check[%d] = %+v, want ssh_config/iproute2", i, c)
 		}
 	}
 
-	// An entry with an empty Type also defaults to iproute2.
+	// An empty entry also takes the defaults.
 	var alerter3 captureAlerter
 	checks, _ = parseInput(strings.NewReader(input), &alerter3, false, "",
-		map[string]HostConfig{"foo.example.com": {}})
-	if checks[0].Type != "iproute2" {
-		t.Errorf("empty-type check Type = %q, want %q", checks[0].Type, "iproute2")
+		Config{Hosts: map[string]HostConfig{"foo.example.com": {}}})
+	if checks[0].Connect != "ssh_config" || checks[0].CheckName != "iproute2" {
+		t.Errorf("empty-entry check = %+v, want ssh_config/iproute2", checks[0])
+	}
+
+	// --connect-default=ip applies to entries without connect and to absent
+	// hosts, but not over an explicit connect.
+	var alerter4 captureAlerter
+	checks, _ = parseInput(strings.NewReader(input), &alerter4, false, "", Config{
+		ConnectDefault: "ip",
+		Hosts:          map[string]HostConfig{"foo.example.com": {Check: "aws"}, "gw.example.com": {Connect: "ssh_config"}},
+	})
+	wantDef := []Check{
+		{"foo.example.com", "10.0.0.1", "ip", "aws"},
+		{"bar.example.com", "10.0.0.2", "ip", "iproute2"},
+		{"gw.example.com", "10.0.0.3", "ssh_config", "iproute2"},
+	}
+	if !slices.Equal(checks, wantDef) {
+		t.Errorf("connect-default ip checks = %+v, want %+v", checks, wantDef)
 	}
 }
 
@@ -292,7 +308,7 @@ func TestValidHostname(t *testing.T) {
 }
 
 func TestSSHArgs(t *testing.T) {
-	c := Check{Hostname: "web1", IP: "10.0.0.1", Type: "iproute2"}
+	c := Check{Hostname: "web1", IP: "10.0.0.1", Connect: "ssh_config", CheckName: "iproute2"}
 	want := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "web1", "ip address"}
 	if got := sshArgs(c, 10, ""); !slices.Equal(got, want) {
 		t.Errorf("sshArgs(iproute2) = %q, want %q", got, want)
@@ -309,8 +325,8 @@ func TestSSHArgs(t *testing.T) {
 		t.Errorf("sshArgs(identity) = %q, want %q", got, wantID)
 	}
 
-	// aws type: same argv shape, remote command is the IMDS snippet.
-	c.Type = "aws"
+	// aws check: same argv shape, remote command is the IMDS snippet.
+	c.CheckName = "aws"
 	got := sshArgs(c, 10, "")
 	if len(got) != len(want) {
 		t.Fatalf("sshArgs(aws) has %d args, want %d: %q", len(got), len(want), got)
@@ -320,10 +336,10 @@ func TestSSHArgs(t *testing.T) {
 		t.Errorf("aws remote command missing expected content: %q", remote)
 	}
 
-	// ifconfig type: same argv shape, remote command is the fixed
+	// ifconfig check: same argv shape, remote command is the fixed
 	// both-families ifconfig command, whatever the expected IP's family.
 	for _, ip := range []string{"10.0.0.1", "2001:db8::1"} {
-		c = Check{Hostname: "web1", IP: ip, Type: "ifconfig"}
+		c = Check{Hostname: "web1", IP: ip, Connect: "ssh_config", CheckName: "ifconfig"}
 		got = sshArgs(c, 10, "")
 		wantIfc := append(slices.Clone(want[:len(want)-1]), ifconfigCommand)
 		if !slices.Equal(got, wantIfc) {
@@ -337,50 +353,77 @@ func TestSSHArgs(t *testing.T) {
 		}
 	}
 
-	// Unknown or empty type falls back to the default command, so a
-	// zero-value Check still runs a sane check.
-	c.Type = ""
-	got = sshArgs(c, 10, "")
-	if got[len(got)-1] != "ip address" {
-		t.Errorf("empty type remote command = %q, want %q", got[len(got)-1], "ip address")
+	// none check: remote command is `true`.
+	c = Check{Hostname: "web1", IP: "10.0.0.1", Connect: "ip", CheckName: "none"}
+	if got = sshArgs(c, 10, ""); got[len(got)-1] != "true" {
+		t.Errorf("none remote command = %q, want %q", got[len(got)-1], "true")
+	}
+
+	// Unknown or empty check falls back to the default command, and empty
+	// connect to no HostName override, so a zero-value Check still runs a
+	// sane check.
+	got = sshArgs(Check{Hostname: "web1", IP: "10.0.0.1"}, 10, "")
+	if !slices.Equal(got, want) {
+		t.Errorf("zero Check sshArgs = %q, want %q", got, want)
 	}
 }
 
-func TestSSHArgsConnect(t *testing.T) {
-	c := Check{Hostname: "gitlab", IP: "116.202.209.119", Type: "connect"}
-	want := []string{
-		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-		"-o", "HostName=116.202.209.119",
-		"--", "gitlab", "ip address",
-	}
-	if got := sshArgs(c, 10, ""); !slices.Equal(got, want) {
-		t.Errorf("sshArgs(connect) = %q, want %q", got, want)
-	}
+func TestSSHArgsConnectIP(t *testing.T) {
+	for _, check := range []string{"iproute2", "aws", "ifconfig", "none"} {
+		c := Check{Hostname: "gitlab", IP: "116.202.209.119", Connect: "ip", CheckName: check}
+		remote := checkCommands[check]
+		want := []string{
+			"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+			"-o", "HostName=116.202.209.119",
+			"--", "gitlab", remote,
+		}
+		if got := sshArgs(c, 10, ""); !slices.Equal(got, want) {
+			t.Errorf("sshArgs(ip, %s) = %q, want %q", check, got, want)
+		}
 
-	wantID := []string{
-		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-		"-o", "HostName=116.202.209.119",
-		"-i", "/root/.ssh/id_ipsentinel", "-o", "IdentitiesOnly=yes",
-		"--", "gitlab", "ip address",
-	}
-	if got := sshArgs(c, 10, "/root/.ssh/id_ipsentinel"); !slices.Equal(got, wantID) {
-		t.Errorf("sshArgs(connect, identity) = %q, want %q", got, wantID)
-	}
+		wantID := []string{
+			"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+			"-o", "HostName=116.202.209.119",
+			"-i", "/root/.ssh/id_ipsentinel", "-o", "IdentitiesOnly=yes",
+			"--", "gitlab", remote,
+		}
+		if got := sshArgs(c, 10, "/root/.ssh/id_ipsentinel"); !slices.Equal(got, wantID) {
+			t.Errorf("sshArgs(ip, %s, identity) = %q, want %q", check, got, wantID)
+		}
 
-	// IPv6 is passed bare: ssh's HostName takes an unbracketed address.
-	c.IP = "2001:db8::1"
-	got := sshArgs(c, 10, "")
-	if i := slices.Index(got, "HostName=2001:db8::1"); i < 1 || got[i-1] != "-o" || i > slices.Index(got, "--") {
-		t.Errorf("sshArgs(connect, ipv6) missing -o HostName=2001:db8::1 before --: %q", got)
-	}
+		// IPv6 is passed bare: ssh's HostName takes an unbracketed address.
+		c.IP = "2001:db8::1"
+		got := sshArgs(c, 10, "")
+		if i := slices.Index(got, "HostName=2001:db8::1"); i < 1 || got[i-1] != "-o" || i > slices.Index(got, "--") {
+			t.Errorf("sshArgs(ip, %s, ipv6) missing -o HostName=2001:db8::1 before --: %q", check, got)
+		}
 
-	// No other type overrides HostName.
-	for _, typ := range []string{"iproute2", "aws", "ifconfig"} {
-		c := Check{Hostname: "web1", IP: "10.0.0.1", Type: typ}
-		for _, a := range sshArgs(c, 10, "") {
-			if strings.HasPrefix(a, "HostName=") {
-				t.Errorf("sshArgs(%q) unexpectedly sets %s", typ, a)
+		// connect: ssh_config (or unset) never overrides HostName.
+		for _, connect := range []string{"ssh_config", ""} {
+			c := Check{Hostname: "web1", IP: "10.0.0.1", Connect: connect, CheckName: check}
+			for _, a := range sshArgs(c, 10, "/root/.ssh/id_ipsentinel") {
+				if strings.HasPrefix(a, "HostName=") {
+					t.Errorf("sshArgs(%q, %s) unexpectedly sets %s", connect, check, a)
+				}
 			}
+		}
+	}
+}
+
+// TestSSHArgsConnectDefault pins the end-to-end path for --connect-default:
+// a host with no config entry gets the HostName override when the default is
+// ip, and not when it's ssh_config.
+func TestSSHArgsConnectDefault(t *testing.T) {
+	for _, tt := range []struct {
+		def  string
+		want bool
+	}{{"ip", true}, {"ssh_config", false}} {
+		var alerter captureAlerter
+		checks, _ := parseInput(strings.NewReader("web1.example.com,192.0.2.7\n"), &alerter, false, "",
+			Config{ConnectDefault: tt.def, Hosts: map[string]HostConfig{"other.example.com": {Check: "aws"}}})
+		got := sshArgs(checks[0], 10, "")
+		if has := slices.Contains(got, "HostName=192.0.2.7"); has != tt.want {
+			t.Errorf("default %s: HostName override = %v, want %v: %q", tt.def, has, tt.want, got)
 		}
 	}
 }
@@ -398,16 +441,18 @@ func TestVerifyOutput(t *testing.T) {
 		out     string
 		wantErr bool
 	}{
-		{"connect passes without the ip in output", Check{IP: "116.202.209.119", Type: "connect"}, out, false},
-		{"connect passes on empty output", Check{IP: "116.202.209.119", Type: "connect"}, "", false},
-		{"iproute2 fails without the ip", Check{IP: "116.202.209.119", Type: "iproute2"}, out, true},
-		{"iproute2 passes with the ip", Check{IP: "10.20.0.5", Type: "iproute2"}, out, false},
-		{"aws fails without the ip", Check{IP: "116.202.209.119", Type: "aws"}, out, true},
-		{"ifconfig fails without the ip", Check{IP: "116.202.209.119", Type: "ifconfig"}, out, true},
-		{"ifconfig passes with the ipv4 from the -4 curl", Check{IP: "203.0.113.7", Type: "ifconfig"}, ifconfigOut, false},
-		{"ifconfig passes with the ipv6 from the -6 curl", Check{IP: "2001:db8:1::7", Type: "ifconfig"}, ifconfigOut, false},
-		{"ifconfig fails when neither curl has the ip", Check{IP: "2001:db8:1::8", Type: "ifconfig"}, ifconfigOut, true},
-		{"default type fails without the ip", Check{IP: "116.202.209.119"}, out, true},
+		{"none passes without the ip in output", Check{IP: "116.202.209.119", Connect: "ip", CheckName: "none"}, out, false},
+		{"none passes on empty output", Check{IP: "116.202.209.119", Connect: "ip", CheckName: "none"}, "", false},
+		{"iproute2 fails without the ip", Check{IP: "116.202.209.119", CheckName: "iproute2"}, out, true},
+		{"iproute2 passes with the ip", Check{IP: "10.20.0.5", CheckName: "iproute2"}, out, false},
+		{"iproute2 with connect ip still requires the ip", Check{IP: "116.202.209.119", Connect: "ip", CheckName: "iproute2"}, out, true},
+		{"iproute2 with connect ip passes with the ip", Check{IP: "10.20.0.5", Connect: "ip", CheckName: "iproute2"}, out, false},
+		{"aws fails without the ip", Check{IP: "116.202.209.119", CheckName: "aws"}, out, true},
+		{"ifconfig fails without the ip", Check{IP: "116.202.209.119", CheckName: "ifconfig"}, out, true},
+		{"ifconfig passes with the ipv4 from the -4 curl", Check{IP: "203.0.113.7", CheckName: "ifconfig"}, ifconfigOut, false},
+		{"ifconfig passes with the ipv6 from the -6 curl", Check{IP: "2001:db8:1::7", CheckName: "ifconfig"}, ifconfigOut, false},
+		{"ifconfig fails when neither curl has the ip", Check{IP: "2001:db8:1::8", CheckName: "ifconfig"}, ifconfigOut, true},
+		{"default check fails without the ip", Check{IP: "116.202.209.119"}, out, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -420,7 +465,7 @@ func TestVerifyOutput(t *testing.T) {
 }
 
 // TestRetryableHostKeyFailure pins that an unknown or changed host key — how
-// a connect check fails when its IP no longer reaches the host, or before
+// a connect: ip check fails when its IP no longer reaches the host, or before
 // the one-off key acceptance — is a hard failure, alerted at once.
 func TestRetryableHostKeyFailure(t *testing.T) {
 	for _, s := range []string{
