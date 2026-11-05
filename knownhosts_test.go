@@ -320,3 +320,32 @@ func TestRunKnownHostsHashedRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestFindKeysStatError checks that a known_hosts file that cannot be
+// stat'ed for a reason other than not existing is an error, not skipped.
+func TestFindKeysStatError(t *testing.T) {
+	needKeygen(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+	dir := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "known_hosts")
+	if err := os.WriteFile(file, []byte("web1 "+keyA+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	missing := filepath.Join(t.TempDir(), "absent")
+	if keys, err := findKeys(context.Background(), realKnownHostsEnv(), "web1", []string{missing}); err != nil || keys != nil {
+		t.Errorf("missing file: keys = %v, err = %v; want nil, nil", keys, err)
+	}
+	if _, err := findKeys(context.Background(), realKnownHostsEnv(), "web1", []string{file}); err == nil {
+		t.Error("unreadable file: err = nil, want an error")
+	}
+}

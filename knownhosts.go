@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -198,13 +199,17 @@ func hashKnownHostsName(name string, salt []byte) string {
 }
 
 // findKeys returns the keys recorded for name across files, deduplicated.
-// Files that do not exist are skipped, since ssh-keygen -F fails on them.
+// Files that do not exist are skipped, since ssh-keygen -F fails on them;
+// any other stat failure (e.g. permission denied) is returned, so an
+// unreadable file cannot hide a key and is reported as a problem.
 func findKeys(ctx context.Context, env knownHostsEnv, name string, files []string) ([]hostKey, error) {
 	var keys []hostKey
 	seen := make(map[hostKey]bool)
 	for _, f := range files {
-		if _, err := os.Stat(f); err != nil {
+		if _, err := os.Stat(f); errors.Is(err, fs.ErrNotExist) {
 			continue
+		} else if err != nil {
+			return nil, err
 		}
 		out, err := env.keygenFind(ctx, name, f)
 		if err != nil {
