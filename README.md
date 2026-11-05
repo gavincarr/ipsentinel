@@ -65,6 +65,36 @@ Run `ipsentinel --help` for the shared options and
 `ipsentinel check --help` for the check options.
 
 
+First run
+---------
+
+`connect: ip` is the default, so each host's key has to be recorded
+under its ip name before its check can pass. On a first run that is
+true of nothing, and `check` alerts every host. Record the keys first:
+
+    $ tinydnsip -d example.com data |
+        ipsentinel known-hosts -c ipsentinel.yml -s example.com
+    [192.0.2.10]:2222 ssh-ed25519 AAAA...
+
+Review the lines (they are copies of keys you already trust under each
+host's usual name, and `known-hosts` connects to nothing), then append
+them and run the check:
+
+    $ tinydnsip -d example.com data |
+        ipsentinel known-hosts -c ipsentinel.yml -s example.com >> ~/.ssh/known_hosts
+    $ tinydnsip -d example.com data |
+        ipsentinel -c ipsentinel.yml -s example.com
+
+Hosts that `known-hosts` reports as problems, typically because no key
+is recorded under their usual name either, need the manual steps under
+[`connect: ip`](#connect-ip). Or, to check by hostname as earlier
+versions did, pass `--connect-default=ssh_config`.
+
+You don't have to remember any of this: when a run fails for this
+reason, `check` ends with a hint pointing the same way (see
+[Output](#output)).
+
+
 Output
 ------
 
@@ -73,6 +103,28 @@ cron without a filter — you only hear from it when something is wrong.
 On stderr you get alerts for failed checks, a warning for malformed
 input lines, and a summary line when the run ends with failures; the
 exit code is 1 if any check failed.
+
+A `connect: ip` host whose key isn't recorded under its ip name yet
+alerts with the reason `host key not recorded for ip`, rather than the
+generic `check failed`. That is the expected state on a first run and is
+fixable. A *changed* or *revoked* key is never reported this way: ssh
+flags those with a warning banner, and they stay `check failed`, since
+they are real alarms. If any host was alerted as not recorded, the run
+ends with a hint, e.g.:
+
+    WRN 12 of 14 connect: ip hosts failed: host key not recorded under the ip yet
+    WRN 11 can be fixed with: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> /home/me/.ssh/known_hosts
+    WRN 1 have no known key at all; add them by hand, see README "connect: ip"
+    WRN to check by hostname instead, pass --connect-default=ssh_config
+
+The second line is `known-hosts` diagnosing the failed hosts locally
+(it connects to nothing) and echoing your own `-c`, `--connect-default`
+and `-s`/`-S`. It ends `>> <file>` when all the fixable hosts share one
+`UserKnownHostsFile`, and `and append its output to your known_hosts`
+otherwise. The third appears only if some hosts have no key to copy,
+and the last only when the run looks like a first run: at least 3 hosts
+failed and they are at least half of the `connect: ip` hosts. See
+[First run](#first-run).
 
 `-v`/`--verbose` is repeatable and raises the verbosity a level each
 time:
@@ -197,11 +249,9 @@ it. Because it changes which entries are valid (`check: none` with no
 `--connect-default=ssh_config`), it's a shared flag, so all commands
 validate a config identically.
 
-Before `ip` became the default, `ssh_config` was. Upgrading from that,
-run `ipsentinel known-hosts` first (see [Known hosts](#known-hosts)):
-until each host's key is recorded under its ip name, its check fails
-with `Host key verification failed`. To keep the old behaviour, pass
-`--connect-default=ssh_config`.
+Before `ip` became the default, `ssh_config` was. Upgrading from that
+is a first run of sorts: see [First run](#first-run), or pass
+`--connect-default=ssh_config` to keep the old behaviour.
 
 Config entries for hosts not present on stdin are ignored, so one config
 file can cover a superset of any given input.
@@ -261,8 +311,7 @@ ipsentinel deliberately won't auto-accept host keys (that would defeat
 the check), so each `connect: ip` host needs a one-off setup to record
 its key under the new name, `[<ip>]:<port>` (or just `<ip>` on port 22).
 Until that's done — and again whenever such a host's ip changes, or a
-new one is added — its check
-fails with `Host key verification failed`.
+new one is added — its check fails with `host key not recorded for ip`.
 
 `ipsentinel known-hosts` is the first-line fix: it prints the lines to
 add (see [Known hosts](#known-hosts)). For a host it can't handle (it
@@ -315,6 +364,14 @@ messages go to stderr. Review the lines, then append them:
     [192.0.2.10]:2222 ssh-ed25519 AAAA...
     $ tinydnsip -d example.com data |
         ipsentinel known-hosts -c ipsentinel.yml -s example.com >> ~/.ssh/known_hosts
+
+When it prints lines, it ends with a warning (shown at the default
+verbosity, as the output is no use until appended) saying where they
+belong: `printed 3 known_hosts lines for /home/me/.ssh/known_hosts` when
+every printing host agrees on the file, otherwise `printed 3 known_hosts
+lines; they belong in each host's UserKnownHostsFile`. When there is
+nothing to print and no problems, it says `nothing new to print`, but
+only with `-v`.
 
 Things to know:
 
