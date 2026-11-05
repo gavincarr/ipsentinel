@@ -69,8 +69,9 @@ First run
 ---------
 
 `connect: ip` is the default, so each host's key has to be recorded
-under its ip name before its check can pass. On a first run that is
-true of nothing, and `check` alerts every host. Record the keys first:
+under its ip name before its check can pass. On a first run none are
+recorded yet, so `check` alerts every `connect: ip` host. Record the
+keys first:
 
     $ tinydnsip -d example.com data |
         ipsentinel known-hosts -c ipsentinel.yml -s example.com
@@ -85,10 +86,12 @@ them and run the check:
     $ tinydnsip -d example.com data |
         ipsentinel -c ipsentinel.yml -s example.com
 
-Hosts that `known-hosts` reports as problems, typically because no key
-is recorded under their usual name either, need the manual steps under
-[`connect: ip`](#connect-ip). Or, to check by hostname as earlier
-versions did, pass `--connect-default=ssh_config`.
+Only hosts that `known-hosts` reports as `no known host key for host`
+(no key is recorded under their usual name either) need the manual steps
+under [`connect: ip`](#connect-ip). Any other problem it reports, about
+a revoked key or an ip that already has a different key, is an alarm to
+investigate, not a setup gap: don't work around it. To check by
+hostname as earlier versions did, pass `--connect-default=ssh_config`.
 
 You don't have to remember any of this: when a run fails for this
 reason, `check` ends with a hint pointing the same way (see
@@ -107,24 +110,39 @@ exit code is 1 if any check failed.
 A `connect: ip` host whose key isn't recorded under its ip name yet
 alerts with the reason `host key not recorded for ip`, rather than the
 generic `check failed`. That is the expected state on a first run and is
-fixable. A *changed* or *revoked* key is never reported this way: ssh
-flags those with a warning banner, and they stay `check failed`, since
-they are real alarms. If any host was alerted as not recorded, the run
-ends with a hint, e.g.:
+fixable. A *changed*, *revoked* or *different-type* key is never
+reported this way: ssh flags those with a warning banner (or, for a
+server presenting a different key type from the recorded one, with
+`key found for host` or `keys of different type are already known`), and
+they stay `check failed`, since they are real alarms. If any host was
+alerted as not recorded, the run ends with a hint, e.g.:
 
-    WRN 12 of 14 connect: ip hosts failed: host key not recorded under the ip yet
-    WRN 11 can be fixed with: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> /home/me/.ssh/known_hosts
-    WRN 1 have no known key at all; add them by hand, see README "connect: ip"
+    WRN 13 of 15 connect: ip hosts failed: host key not recorded under the ip yet
+    WRN 10 can be fixed by piping the same input to: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> /home/me/.ssh/known_hosts
+    WRN 2 have no known key at all; add them by hand, see README "connect: ip"
+    WRN 1 already have a different key recorded under the ip; investigate, this may be a changed key
     WRN to check by hostname instead, pass --connect-default=ssh_config
 
-The second line is `known-hosts` diagnosing the failed hosts locally
-(it connects to nothing) and echoing your own `-c`, `--connect-default`
-and `-s`/`-S`. It ends `>> <file>` when all the fixable hosts share one
+The second line is `check` diagnosing the failed hosts locally, with
+the same logic as `known-hosts` (it connects to nothing), and echoing
+your own `-c`, `--connect-default` and `-s`/`-S`. `known-hosts` reads
+its hosts from stdin, so pipe it the same input as the check. The line
+ends `>> <file>` when all the fixable hosts share one
 `UserKnownHostsFile`, and `and append its output to your known_hosts`
-otherwise. The third appears only if some hosts have no key to copy,
-and the last only when the run looks like a first run: at least 3 hosts
-failed and they are at least half of the `connect: ip` hosts. See
-[First run](#first-run).
+otherwise. The third appears only if some hosts have no key to copy.
+
+The fourth is an **alarm**, not a setup gap: the ip already has a key
+recorded, yet ssh found none that matched, so the host may be presenting
+a changed key. Investigate before recording anything. (Hosts with a
+revoked key, or whose diagnosis failed, count in the first line but get
+no line of their own; run `known-hosts` to see why.) The last appears
+only when the run looks like a first run, at least 3 hosts failed and
+they are at least half of the `connect: ip` hosts, and unless the run
+already defaults to `ssh_config`. See [First run](#first-run).
+
+With `-v`, the hint is preceded by `diagnosing N hosts with unrecorded
+ip host keys`, as diagnosing a big input one host at a time can take a
+while.
 
 `-v`/`--verbose` is repeatable and raises the verbosity a level each
 time:
@@ -323,6 +341,12 @@ hand:
 
        ssh-keygen -l -F '[<host>]:<port>'    # or '<host>' on port 22
 
+   If nothing is recorded under the usual name either, there is nothing
+   to compare against, so get the fingerprint from the host itself, out
+   of band (e.g. on its console, or over a channel you already trust):
+
+       ssh-keygen -l -f /etc/ssh/ssh_host_ed25519_key.pub
+
 2. Connect to the ip interactively:
 
        ssh -o HostName=<ip> <host> true
@@ -370,8 +394,13 @@ verbosity, as the output is no use until appended) saying where they
 belong: `printed 3 known_hosts lines for /home/me/.ssh/known_hosts` when
 every printing host agrees on the file, otherwise `printed 3 known_hosts
 lines; they belong in each host's UserKnownHostsFile`. When there is
-nothing to print and no problems, it says `nothing new to print`, but
-only with `-v`.
+nothing to print and no problems (and the input had `connect: ip`
+hosts), it says `nothing new to print`, but only with `-v`.
+
+The `>> <file>` in `check`'s end-of-run hint is decided from the failed
+hosts alone, while `known-hosts` processes all of its input. This
+closing line is the authority on where its lines belong, so check it
+if the two differ.
 
 Things to know:
 
