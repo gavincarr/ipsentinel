@@ -86,10 +86,9 @@ func (a *AuthorizedKeysCmd) AfterApply(kctx *kong.Context) error {
 
 // Check is a single hostname,ip pair to verify.
 type Check struct {
-	Hostname  string
-	IP        string
-	Type      string // check type: a checkCommands key, resolved by parseInput
-	IPVersion string // "4"/"6" to force the ifconfig curl's family, else ""
+	Hostname string
+	IP       string
+	Type     string // check type: a checkCommands key, resolved by parseInput
 }
 
 // validHostname guards against argv flag smuggling: a hostname read from stdin
@@ -292,7 +291,7 @@ func parseInput(r io.Reader, alerter Alerter, stripAll bool, domain string, conf
 		if stripAll {
 			host = stripHostname(host)
 		}
-		checks = append(checks, Check{Hostname: host, IP: ip, Type: hc.checkType(), IPVersion: hc.IPVersion})
+		checks = append(checks, Check{Hostname: host, IP: ip, Type: hc.checkType()})
 	}
 	if err := sc.Err(); err != nil {
 		alerter.Alert(Check{}, "error reading stdin", err)
@@ -334,11 +333,6 @@ func sshArgs(c Check, connectTimeoutSeconds int, identityFile string) []string {
 // always exactly what ipsentinel sends it. Unknown or empty types fall back
 // to the default.
 func remoteCommand(c Check) string {
-	// ip_version only shapes the ifconfig curl; loadConfig rejects it for
-	// any other type, so this stays scoped to ifconfig.
-	if c.Type == "ifconfig" && c.IPVersion != "" {
-		return ifconfigCommand(c.IPVersion)
-	}
 	if command, ok := checkCommands[c.Type]; ok {
 		return command
 	}

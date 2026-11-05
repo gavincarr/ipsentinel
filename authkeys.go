@@ -30,7 +30,7 @@ func forcedCommand(c Check) (string, error) {
 	flat := strings.Join(strings.Split(remoteCommand(c), "\n"), "; ")
 	if strings.Contains(flat, `\`) {
 		return "", fmt.Errorf("remote command for type %s contains a backslash, which cannot be safely quoted for authorized_keys: %q",
-			describeType(c), flat)
+			c.Type, flat)
 	}
 	return strings.ReplaceAll(flat, `"`, `\"`), nil
 }
@@ -123,15 +123,6 @@ func hasAnyPrefix(s string, prefixes []string) bool {
 	return false
 }
 
-// describeType renders c's check type for log messages, including any
-// ip_version, since that changes the command too.
-func describeType(c Check) string {
-	if c.IPVersion != "" {
-		return c.Type + " (ip_version " + c.IPVersion + ")"
-	}
-	return c.Type
-}
-
 // akRow is one row of authorized-keys output: a label (a host as given, or
 // a check variant name) and its authorized_keys line.
 type akRow struct {
@@ -159,22 +150,15 @@ func writeTable(w io.Writer, rows []akRow) error {
 	return nil
 }
 
-// variant is a named check variant: a check type, plus an ip_version for the
-// ifconfig variants that pin curl's address family.
-type variant struct {
-	label string
-	check Check
-}
-
 // variantTypeOrder is the preferred display order of check types in variant
 // mode. Types in checkCommands but missing here still appear, sorted, after
 // these, so a new type can never be silently left out.
 var variantTypeOrder = []string{"iproute2", "connect", "aws", "ifconfig"}
 
-// checkVariants returns every distinct check variant: each checkCommands
-// type, and for ifconfig one extra variant per ip_version (ifconfig-v4,
-// ifconfig-v6), since ip_version changes the forced command.
-func checkVariants() []variant {
+// checkVariants returns every check type in checkCommands, in display order
+// (see variantTypeOrder). Each type is one variant: its name is the row
+// label, and its forced command that of Check{Type: name}.
+func checkVariants() []string {
 	var types []string
 	for _, t := range variantTypeOrder {
 		if _, ok := checkCommands[t]; ok {
@@ -186,16 +170,7 @@ func checkVariants() []variant {
 			types = append(types, t)
 		}
 	}
-	var vs []variant
-	for _, t := range types {
-		vs = append(vs, variant{t, Check{Type: t}})
-		if t == "ifconfig" {
-			for _, v := range ipVersions {
-				vs = append(vs, variant{t + "-v" + v, Check{Type: t, IPVersion: v}})
-			}
-		}
-	}
-	return vs
+	return types
 }
 
 // resolveHost builds the Check for host (labelled exactly as given; no
@@ -206,7 +181,7 @@ func checkVariants() []variant {
 // else it's an error naming each candidate and its type.
 func resolveHost(host string, config map[string]HostConfig) (Check, error) {
 	mk := func(hc HostConfig) Check {
-		return Check{Hostname: host, Type: hc.checkType(), IPVersion: hc.IPVersion}
+		return Check{Hostname: host, Type: hc.checkType()}
 	}
 	if hc, ok := config[host]; ok {
 		return mk(hc), nil
@@ -227,7 +202,7 @@ func resolveHost(host string, config map[string]HostConfig) (Check, error) {
 		if remoteCommand(mk(config[k])) != want {
 			descs := make([]string, len(keys))
 			for i, k := range keys {
-				descs[i] = k + " (" + describeType(mk(config[k])) + ")"
+				descs[i] = k + " (" + mk(config[k]).Type + ")"
 			}
 			return Check{}, fmt.Errorf("ambiguous: matches config entries with different check types: %s",
 				strings.Join(descs, ", "))
@@ -264,8 +239,8 @@ func runAuthorizedKeys(hosts []string, config map[string]HostConfig, log *slog.L
 	}
 
 	if len(hosts) == 0 {
-		for _, v := range checkVariants() {
-			add(v.label, v.check)
+		for _, t := range checkVariants() {
+			add(t, Check{Type: t})
 		}
 	} else {
 		seen := make(map[string]bool)

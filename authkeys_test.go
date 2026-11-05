@@ -21,6 +21,9 @@ const (
 	testPubkey          = testPubkeyNoComment + " ipsentinel@mon"
 )
 
+// ifconfigForced is the ifconfig check's flattened forced command.
+const ifconfigForced = "ip address; curl -sf -4 -m 2 https://ifconfig.me || true; echo; curl -sf -6 -m 2 https://ifconfig.me || true; echo"
+
 func TestForcedCommand(t *testing.T) {
 	tests := []struct {
 		name string
@@ -30,12 +33,7 @@ func TestForcedCommand(t *testing.T) {
 		{"iproute2", Check{Type: "iproute2"}, "ip address"},
 		{"connect", Check{Type: "connect"}, "ip address"},
 		{"empty type defaults", Check{}, "ip address"},
-		{"ifconfig", Check{Type: "ifconfig"},
-			"ip address; curl -sf -m 2 https://ifconfig.me || true; echo"},
-		{"ifconfig ip_version 4", Check{Type: "ifconfig", IPVersion: "4"},
-			"ip address; curl -sf -4 -m 2 https://ifconfig.me || true; echo"},
-		{"ifconfig ip_version 6", Check{Type: "ifconfig", IPVersion: "6"},
-			"ip address; curl -sf -6 -m 2 https://ifconfig.me || true; echo"},
+		{"ifconfig queries both families", Check{Type: "ifconfig"}, ifconfigForced},
 		{"aws", Check{Type: "aws"},
 			`ip address; ` +
 				`TOKEN=$(curl -sf -m 2 -X PUT -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\" http://169.254.169.254/latest/api/token 2>/dev/null) || true; ` +
@@ -84,16 +82,14 @@ func TestForcedCommandShippedCommandsQuotable(t *testing.T) {
 		{Type: "connect"},
 		{Type: "aws"},
 		{Type: "ifconfig"},
-		{Type: "ifconfig", IPVersion: "4"},
-		{Type: "ifconfig", IPVersion: "6"},
 	}
 	for _, c := range checks {
 		flat := strings.Join(strings.Split(remoteCommand(c), "\n"), "; ")
 		if strings.ContainsAny(flat, "\\\n\r") {
-			t.Errorf("%s: flattened command contains a backslash or newline: %q", describeType(c), flat)
+			t.Errorf("%s: flattened command contains a backslash or newline: %q", c.Type, flat)
 		}
 		if _, err := forcedCommand(c); err != nil {
-			t.Errorf("%s: forcedCommand: %v", describeType(c), err)
+			t.Errorf("%s: forcedCommand: %v", c.Type, err)
 		}
 	}
 }
@@ -238,13 +234,15 @@ func TestResolveHost(t *testing.T) {
 		"app":                {Type: "aws"},
 		"app.example.com":    {Type: "iproute2"},
 		"web1.example.com":   {Type: "aws"},
-		"facts.example.com":  {Type: "ifconfig", IPVersion: "4"},
+		"facts.example.com":  {Type: "ifconfig"},
 		"db.example.com":     {Type: "aws"},
 		"db.example.net":     {Type: "aws"},
 		"mx.example.com":     {Type: "aws"},
 		"mx.example.net":     {Type: "iproute2"},
 		"ifc.example.com":    {Type: "ifconfig"},
-		"ifc.example.net":    {Type: "ifconfig", IPVersion: "6"},
+		"ifc.example.net":    {Type: "ifconfig"}, // one ifconfig command for all
+		"ifa.example.com":    {Type: "ifconfig"},
+		"ifa.example.net":    {Type: "aws"},
 		"dflt.example.com":   {},
 		"dflt.example.net":   {Type: "iproute2"}, // same as the default
 		"gitlab.example.com": {Type: "connect"},
@@ -262,7 +260,8 @@ func TestResolveHost(t *testing.T) {
 		{"app", Check{Hostname: "app", Type: "aws"}, nil}, // exact match beats prefix
 		{"web1", Check{Hostname: "web1", Type: "aws"}, nil},
 		{"web1.example", Check{Hostname: "web1.example", Type: "aws"}, nil},
-		{"facts", Check{Hostname: "facts", Type: "ifconfig", IPVersion: "4"}, nil},
+		{"facts", Check{Hostname: "facts", Type: "ifconfig"}, nil},
+		{"ifc", Check{Hostname: "ifc", Type: "ifconfig"}, nil},
 		{"web", Check{Hostname: "web", Type: "iproute2"}, nil}, // prefix must end on a label
 		{"nothere", Check{Hostname: "nothere", Type: "iproute2"}, nil},
 		{"db", Check{Hostname: "db", Type: "aws"}, nil},
@@ -272,7 +271,7 @@ func TestResolveHost(t *testing.T) {
 		{"git", Check{Hostname: "git", Type: "connect"}, nil}, // connect and iproute2 share a command
 		{"gw", Check{}, []string{"gw.example.com (connect)", "gw.example.net (aws)"}},
 		{"mx", Check{}, []string{"mx.example.com (aws)", "mx.example.net (iproute2)"}},
-		{"ifc", Check{}, []string{"ifc.example.com (ifconfig)", "ifc.example.net (ifconfig (ip_version 6))"}},
+		{"ifa", Check{}, []string{"ifa.example.com (ifconfig)", "ifa.example.net (aws)"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.host, func(t *testing.T) {
@@ -299,7 +298,6 @@ func TestResolveHost(t *testing.T) {
 }
 
 func TestRunAuthorizedKeysHosts(t *testing.T) {
-	const ifconfig4 = "ip address; curl -sf -4 -m 2 https://ifconfig.me || true; echo"
 	aws, err := forcedCommand(Check{Type: "aws"})
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +307,7 @@ func TestRunAuthorizedKeysHosts(t *testing.T) {
 	}
 	config := map[string]HostConfig{
 		"web1.example.com":   {Type: "aws"},
-		"facts.example.com":  {Type: "ifconfig", IPVersion: "4"},
+		"facts.example.com":  {Type: "ifconfig"},
 		"db.example.com":     {Type: "aws"},
 		"db.example.net":     {Type: "aws"},
 		"mx.example.com":     {Type: "aws"},
@@ -328,9 +326,9 @@ func TestRunAuthorizedKeysHosts(t *testing.T) {
 			name:  "exact, prefix, absent; labels as given; dedupe in first-seen order",
 			hosts: []string{"web1.example.com", "facts", "other", "facts", "facts.example.com", "web1.example.com"},
 			wantStdout: "web1.example.com   " + line(aws) + "\n" +
-				"facts              " + line(ifconfig4) + "\n" +
+				"facts              " + line(ifconfigForced) + "\n" +
 				"other              " + line("ip address") + "\n" +
-				"facts.example.com  " + line(ifconfig4) + "\n",
+				"facts.example.com  " + line(ifconfigForced) + "\n",
 			wantExit: 0,
 		},
 		{
@@ -407,11 +405,7 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 		t.Errorf("unexpected stderr:\n%s", stderr.String())
 	}
 
-	wantLabels := []string{"iproute2", "connect", "aws", "ifconfig", "ifconfig-v4", "ifconfig-v6"}
-	wantChecks := []Check{
-		{Type: "iproute2"}, {Type: "connect"}, {Type: "aws"}, {Type: "ifconfig"},
-		{Type: "ifconfig", IPVersion: "4"}, {Type: "ifconfig", IPVersion: "6"},
-	}
+	wantLabels := []string{"iproute2", "connect", "aws", "ifconfig"}
 	rows := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
 	if len(rows) != len(wantLabels) {
 		t.Fatalf("got %d rows, want %d:\n%s", len(rows), len(wantLabels), stdout.String())
@@ -421,7 +415,7 @@ func TestRunAuthorizedKeysVariants(t *testing.T) {
 		if label != wantLabels[i] {
 			t.Errorf("row %d label = %q, want %q", i, label, wantLabels[i])
 		}
-		forced, err := forcedCommand(wantChecks[i])
+		forced, err := forcedCommand(Check{Type: wantLabels[i]})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -438,19 +432,14 @@ func TestCheckVariantsCoverCheckCommands(t *testing.T) {
 	vs := checkVariants()
 	labels := make(map[string]bool)
 	for _, v := range vs {
-		labels[v.label] = true
-		if _, err := forcedCommand(v.check); err != nil {
-			t.Fatalf("%s: %v", v.label, err)
+		labels[v] = true
+		if _, err := forcedCommand(Check{Type: v}); err != nil {
+			t.Fatalf("%s: %v", v, err)
 		}
 	}
 	for typ := range checkCommands {
 		if !labels[typ] {
 			t.Errorf("check type %q missing from checkVariants", typ)
-		}
-	}
-	for _, v := range ipVersions {
-		if !labels["ifconfig-v"+v] {
-			t.Errorf("ifconfig-v%s missing from checkVariants", v)
 		}
 	}
 	if len(vs) != len(labels) {

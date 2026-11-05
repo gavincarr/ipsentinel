@@ -50,9 +50,9 @@ func TestParseInput(t *testing.T) {
 	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", nil)
 
 	wantChecks := []Check{
-		{"host1", "10.0.0.1", "iproute2", ""},
-		{"host2", "10.0.0.2", "iproute2", ""},
-		{"sub.host_alias-1.example.com", "10.0.0.7", "iproute2", ""},
+		{"host1", "10.0.0.1", "iproute2"},
+		{"host2", "10.0.0.2", "iproute2"},
+		{"sub.host_alias-1.example.com", "10.0.0.7", "iproute2"},
 	}
 	if len(checks) != len(wantChecks) {
 		t.Fatalf("got %d checks, want %d: %+v", len(checks), len(wantChecks), checks)
@@ -111,7 +111,7 @@ func TestParseInputStrip(t *testing.T) {
 	// stripAll=true reduces each validated hostname to its leftmost label.
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", nil)
-	wantStripped := []Check{{"foo", "10.0.0.1", "iproute2", ""}, {"bar", "10.0.0.2", "iproute2", ""}}
+	wantStripped := []Check{{"foo", "10.0.0.1", "iproute2"}, {"bar", "10.0.0.2", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -156,7 +156,7 @@ func TestParseInputStripDomain(t *testing.T) {
 	// domain suffix is stripped only where it matches; other hosts pass through.
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "example.com", nil)
-	want := []Check{{"foo", "10.0.0.1", "iproute2", ""}, {"bar.other.com", "10.0.0.2", "iproute2", ""}, {"baz", "10.0.0.3", "iproute2", ""}}
+	want := []Check{{"foo", "10.0.0.1", "iproute2"}, {"bar.other.com", "10.0.0.2", "iproute2"}, {"baz", "10.0.0.3", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -184,9 +184,9 @@ func TestParseInputValidatesIP(t *testing.T) {
 	checks, failures := parseInput(strings.NewReader(input), &alerter, false, "", nil)
 
 	want := []Check{
-		{"host1", "10.0.0.1", "iproute2", ""},
-		{"host5", "fe80::1", "iproute2", ""},
-		{"host6", "fe80::1", "iproute2", ""},
+		{"host1", "10.0.0.1", "iproute2"},
+		{"host5", "fe80::1", "iproute2"},
+		{"host6", "fe80::1", "iproute2"},
 	}
 	if failures != 3 {
 		t.Errorf("got %d failures, want 3", failures)
@@ -244,7 +244,7 @@ func TestParseInputConfigTypes(t *testing.T) {
 	// stripping rewrites what is stored on the Check.
 	var alerter captureAlerter
 	checks, failures := parseInput(strings.NewReader(input), &alerter, true, "", config)
-	want := []Check{{"foo", "10.0.0.1", "aws", ""}, {"bar", "10.0.0.2", "iproute2", ""}}
+	want := []Check{{"foo", "10.0.0.1", "aws"}, {"bar", "10.0.0.2", "iproute2"}}
 	if failures != 0 {
 		t.Fatalf("got %d failures, want 0", failures)
 	}
@@ -320,20 +320,21 @@ func TestSSHArgs(t *testing.T) {
 		t.Errorf("aws remote command missing expected content: %q", remote)
 	}
 
-	// ifconfig type with a forced IP version injects curl's -4/-6 flag.
-	for _, v := range []string{"4", "6"} {
-		c = Check{Hostname: "web1", IP: "10.0.0.1", Type: "ifconfig", IPVersion: v}
-		remote = sshArgs(c, 10, "")[len(sshArgs(c, 10, ""))-1]
-		if !strings.Contains(remote, "curl -sf -"+v+" ") {
-			t.Errorf("ifconfig ip_version %q remote command missing curl -%s flag: %q", v, v, remote)
+	// ifconfig type: same argv shape, remote command is the fixed
+	// both-families ifconfig command, whatever the expected IP's family.
+	for _, ip := range []string{"10.0.0.1", "2001:db8::1"} {
+		c = Check{Hostname: "web1", IP: ip, Type: "ifconfig"}
+		got = sshArgs(c, 10, "")
+		wantIfc := append(slices.Clone(want[:len(want)-1]), ifconfigCommand)
+		if !slices.Equal(got, wantIfc) {
+			t.Errorf("sshArgs(ifconfig, %s) = %q, want %q", ip, got, wantIfc)
 		}
-	}
-
-	// ifconfig without a version leaves curl's default (no -4/-6).
-	c = Check{Hostname: "web1", IP: "10.0.0.1", Type: "ifconfig"}
-	remote = sshArgs(c, 10, "")[len(sshArgs(c, 10, ""))-1]
-	if strings.Contains(remote, "curl -sf -4") || strings.Contains(remote, "curl -sf -6") {
-		t.Errorf("ifconfig without ip_version should not force a family: %q", remote)
+		remote = got[len(got)-1]
+		for _, line := range []string{"\ncurl -sf -4 -m 2 https://ifconfig.me || true\n", "\ncurl -sf -6 -m 2 https://ifconfig.me || true\n"} {
+			if !strings.Contains(remote, line) {
+				t.Errorf("ifconfig remote command missing line %q: %q", line, remote)
+			}
+		}
 	}
 
 	// Unknown or empty type falls back to the default command, so a
@@ -374,7 +375,7 @@ func TestSSHArgsConnect(t *testing.T) {
 	}
 
 	// No other type overrides HostName.
-	for _, typ := range []string{"iproute2", "aws", "ifconfig", ""} {
+	for _, typ := range []string{"iproute2", "aws", "ifconfig"} {
 		c := Check{Hostname: "web1", IP: "10.0.0.1", Type: typ}
 		for _, a := range sshArgs(c, 10, "") {
 			if strings.HasPrefix(a, "HostName=") {
@@ -387,6 +388,10 @@ func TestSSHArgsConnect(t *testing.T) {
 func TestVerifyOutput(t *testing.T) {
 	const out = `2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
     inet 10.20.0.5/24 brd 10.20.0.255 scope global eth0`
+	// ifconfigOut is what the ifconfig command prints on a NATed dual-stack
+	// host: `ip address`, then the -4 curl's answer and its echo, then the -6
+	// curl's answer and its echo. Neither public address is on an interface.
+	const ifconfigOut = out + "\n203.0.113.7\n2001:db8:1::7\n"
 	tests := []struct {
 		name    string
 		c       Check
@@ -399,6 +404,9 @@ func TestVerifyOutput(t *testing.T) {
 		{"iproute2 passes with the ip", Check{IP: "10.20.0.5", Type: "iproute2"}, out, false},
 		{"aws fails without the ip", Check{IP: "116.202.209.119", Type: "aws"}, out, true},
 		{"ifconfig fails without the ip", Check{IP: "116.202.209.119", Type: "ifconfig"}, out, true},
+		{"ifconfig passes with the ipv4 from the -4 curl", Check{IP: "203.0.113.7", Type: "ifconfig"}, ifconfigOut, false},
+		{"ifconfig passes with the ipv6 from the -6 curl", Check{IP: "2001:db8:1::7", Type: "ifconfig"}, ifconfigOut, false},
+		{"ifconfig fails when neither curl has the ip", Check{IP: "2001:db8:1::8", Type: "ifconfig"}, ifconfigOut, true},
 		{"default type fails without the ip", Check{IP: "116.202.209.119"}, out, true},
 	}
 	for _, tt := range tests {

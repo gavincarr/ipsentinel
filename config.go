@@ -30,32 +30,31 @@ TOKEN=$(curl -sf -m 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http:
 curl -sf -m 2 ${TOKEN:+-H "X-aws-ec2-metadata-token: $TOKEN"} http://169.254.169.254/latest/meta-data/public-ipv4 || true`
 
 // ifconfigCommand is the non-AWS counterpart to awsCommand: it runs
-// `ip address` and appends the host's public IPv4 as seen by ifconfig.me.
-// Hosts behind a NAT gateway never have their public address configured on
-// an interface, so asking an external echo service is the only way to see
-// it. As with awsCommand, curl failure is tolerated (|| true) so the check
-// degrades to plain `ip address` matching, and -m 2 caps the request well
-// inside the overall ssh timeout. The trailing `echo` supplies the newline
-// curl's response body lacks.
+// `ip address` and appends the host's public addresses as seen by
+// ifconfig.me. Hosts behind a NAT gateway never have their public address
+// configured on an interface, so asking an external echo service is the only
+// way to see it.
 //
-// ipVersion, when "4" or "6", forces curl's address family via -4/-6 (see
-// HostConfig.IPVersion): a dual-stack host defaults to whichever family curl
-// prefers, which may not be the one we're tracking. "" leaves curl's default.
-func ifconfigCommand(ipVersion string) string {
-	flag := ""
-	if ipVersion != "" {
-		flag = " -" + ipVersion
-	}
-	return `ip address
-curl -sf` + flag + ` -m 2 https://ifconfig.me || true
+// It queries both families (curl -4, then curl -6) rather than letting curl
+// pick one: a dual-stack host, or one with both A and AAAA records, may be
+// checked for either family, and verifyOutput just looks for the expected IP
+// anywhere in the output, so one fixed command serves every ifconfig host
+// and gives each the same authorized_keys forced command. `|| true` tolerates
+// a family the host lacks — curl -6 on an IPv4-only host normally fails fast
+// with "network unreachable", worst case after the -m 2 cap, which keeps both
+// requests well inside the overall ssh timeout — and any other curl failure,
+// so the check degrades to plain `ip address` matching. Each `echo` supplies
+// the newline curl's response body lacks, keeping the two answers apart.
+// Every line is a complete command, as forcedCommand's "; " join requires.
+const ifconfigCommand = `ip address
+curl -sf -4 -m 2 https://ifconfig.me || true
+echo
+curl -sf -6 -m 2 https://ifconfig.me || true
 echo`
-}
 
 // checkCommands maps a check type to the remote command ssh runs on the
 // target host. It is the single source of truth for known types: config
-// validation checks `type` values against these keys. The ifconfig entry is
-// the default (no forced IP version); sshArgs rebuilds it when a host sets
-// ip_version.
+// validation checks `type` values against these keys.
 //
 // connect runs the same `ip address` as iproute2, but its output is not
 // checked: the check is the connection itself (sshArgs points ssh at the
@@ -64,16 +63,25 @@ echo`
 var checkCommands = map[string]string{
 	"iproute2": "ip address",
 	"aws":      awsCommand,
-	"ifconfig": ifconfigCommand(""),
+	"ifconfig": ifconfigCommand,
 	"connect":  "ip address",
 }
 
 // HostConfig holds the per-host settings from the -c/--config file.
 type HostConfig struct {
 	Type string `yaml:"type"`
-	// IPVersion forces the ifconfig check's curl to IPv4 ("4") or IPv6
-	// ("6"); "" lets curl choose. Only meaningful with type: ifconfig.
-	IPVersion string `yaml:"ip_version"`
+}
+
+// rawHostConfig is what loadConfig decodes each host entry into: HostConfig
+// plus retired keys that are still recognised, solely so loadConfig can
+// reject them with an actionable message instead of yaml's generic "field
+// not found" error.
+type rawHostConfig struct {
+	HostConfig `yaml:",inline"`
+	// IPVersion is the retired ip_version key, which used to force the
+	// ifconfig curl to one family. A yaml.Node so that its presence is seen
+	// whatever its value, even null.
+	IPVersion yaml.Node `yaml:"ip_version"`
 }
 
 // checkType returns hc's check type, defaulting to defaultCheckType when
@@ -84,9 +92,6 @@ func (hc HostConfig) checkType() string {
 	}
 	return hc.Type
 }
-
-// ipVersions are the accepted ip_version values (see HostConfig.IPVersion).
-var ipVersions = []string{"4", "6"}
 
 // loadConfig reads the YAML config file at path: a map keyed by (unstripped)
 // hostname with per-host settings. Unknown second-level keys and unknown
@@ -99,28 +104,21 @@ func loadConfig(path string) (map[string]HostConfig, error) {
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
-	config := make(map[string]HostConfig)
-	if err := dec.Decode(&config); err != nil {
+	raw := make(map[string]rawHostConfig)
+	if err := dec.Decode(&raw); err != nil {
 		if errors.Is(err, io.EOF) {
-			return config, nil // empty config file
+			return map[string]HostConfig{}, nil // empty config file
 		}
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	for host, hc := range config {
-		if hc.IPVersion != "" {
-			if !slices.Contains(ipVersions, hc.IPVersion) {
-				return nil, fmt.Errorf(`%s: host %s: invalid ip_version %q (want "4" or "6")`,
-					path, host, hc.IPVersion)
-			}
-			if hc.Type != "ifconfig" {
-				t := hc.Type
-				if t == "" {
-					t = defaultCheckType + " (default)"
-				}
-				return nil, fmt.Errorf("%s: host %s: ip_version requires type ifconfig, got %s",
-					path, host, t)
-			}
+	config := make(map[string]HostConfig, len(raw))
+	for host, rhc := range raw {
+		if !rhc.IPVersion.IsZero() {
+			return nil, fmt.Errorf("%s: host %s: ip_version is no longer supported: "+
+				"ifconfig checks now query both IPv4 and IPv6; remove it", path, host)
 		}
+		hc := rhc.HostConfig
+		config[host] = hc
 		if hc.Type == "" {
 			continue // defaults to defaultCheckType at lookup time
 		}

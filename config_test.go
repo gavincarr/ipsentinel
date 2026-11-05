@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -26,7 +27,6 @@ web2.example.com:
 web3.example.com:
 web4.example.com:
   type: ifconfig
-  ip_version: "6"
 gitlab.example.com:
   type: connect
 `)
@@ -38,7 +38,7 @@ gitlab.example.com:
 		"web1.example.com":   {Type: "aws"},
 		"web2.example.com":   {Type: "iproute2"},
 		"web3.example.com":   {}, // null entry: empty type, defaults later
-		"web4.example.com":   {Type: "ifconfig", IPVersion: "6"},
+		"web4.example.com":   {Type: "ifconfig"},
 		"gitlab.example.com": {Type: "connect"},
 	}
 	if len(config) != len(want) {
@@ -70,10 +70,6 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"malformed yaml", "web1: [unclosed\n", "parsing"},
 		{"unknown type", "web1.example.com:\n  type: gcp\n", `unknown type "gcp"`},
 		{"unknown key", "web1.example.com:\n  tyep: aws\n", "tyep"},
-		{"invalid ip_version", "web1.example.com:\n  type: ifconfig\n  ip_version: \"5\"\n", `invalid ip_version "5"`},
-		{"ip_version wrong type", "web1.example.com:\n  type: aws\n  ip_version: \"4\"\n", "ip_version requires type ifconfig"},
-		{"ip_version default type", "web1.example.com:\n  ip_version: \"4\"\n", "ip_version requires type ifconfig"},
-		{"ip_version connect type", "web1.example.com:\n  type: connect\n  ip_version: \"4\"\n", "ip_version requires type ifconfig, got connect"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -85,6 +81,30 @@ func TestLoadConfigErrors(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err, tt.errWant)
 			}
 		})
+	}
+}
+
+// TestLoadConfigRejectsIPVersion pins that the retired ip_version key fails
+// with an actionable message — not yaml's generic unknown-field error —
+// whatever its value and whatever the host's type.
+func TestLoadConfigRejectsIPVersion(t *testing.T) {
+	const wantMsg = "host web1.example.com: ip_version is no longer supported: " +
+		"ifconfig checks now query both IPv4 and IPv6; remove it"
+	values := []string{`"4"`, `"6"`, "4", `"5"`, `""`, "", "null", "[4, 6]"}
+	types := []string{"", "  type: ifconfig\n", "  type: iproute2\n", "  type: aws\n", "  type: connect\n"}
+	for _, typ := range types {
+		for _, v := range values {
+			content := "web1.example.com:\n" + typ + "  ip_version: " + v + "\n"
+			path := writeConfig(t, content)
+			_, err := loadConfig(path)
+			if err == nil {
+				t.Errorf("loadConfig(%q) = nil error, want ip_version rejection", content)
+				continue
+			}
+			if want := path + ": " + wantMsg; err.Error() != want {
+				t.Errorf("loadConfig(%q) error\n got %q\nwant %q", content, err, want)
+			}
+		}
 	}
 }
 
@@ -104,15 +124,17 @@ func TestCheckCommands(t *testing.T) {
 			t.Errorf(`checkCommands["aws"] missing %q`, needle)
 		}
 	}
-	ifconfig := checkCommands["ifconfig"]
-	for _, needle := range []string{"ip address", "ifconfig.me"} {
-		if !strings.Contains(ifconfig, needle) {
-			t.Errorf(`checkCommands["ifconfig"] missing %q`, needle)
-		}
+	// ifconfig asks ifconfig.me over both families, each curl followed by
+	// an echo for the newline its response body lacks.
+	wantIfconfig := []string{
+		"ip address",
+		"curl -sf -4 -m 2 https://ifconfig.me || true",
+		"echo",
+		"curl -sf -6 -m 2 https://ifconfig.me || true",
+		"echo",
 	}
-	// curl's response body has no trailing newline; the echo supplies one.
-	if !strings.HasSuffix(ifconfig, "\necho") {
-		t.Errorf(`checkCommands["ifconfig"] should end with an echo: %q`, ifconfig)
+	if got := strings.Split(checkCommands["ifconfig"], "\n"); !slices.Equal(got, wantIfconfig) {
+		t.Errorf(`checkCommands["ifconfig"] lines = %q, want %q`, got, wantIfconfig)
 	}
 	// connect deliberately shares iproute2's command, so its forced command
 	// in authorized_keys is identical too.

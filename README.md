@@ -127,9 +127,6 @@ output. Pass a YAML config file with `-c`/`--config`, keyed by hostname
       type: ifconfig
     web3.example.com:
       type: iproute2
-    web4.example.com:
-      type: ifconfig
-      ip_version: "6"
     gitlab.example.com:
       type: connect
 
@@ -142,8 +139,13 @@ Supported per-host keys:
     instance's public IPv4, so both private and public addresses can be
     verified.
   - `ifconfig`: the non-AWS equivalent — additionally query
-    `https://ifconfig.me` for the host's public IPv4 as seen from the
-    outside, for hosts behind a NAT gateway.
+    `https://ifconfig.me` for the host's public addresses as seen from
+    the outside, for hosts behind a NAT gateway. It always asks over
+    both IPv4 and IPv6 (`curl -4`, then `curl -6`) and passes if the
+    expected ip is in any of the output, so dual-stack hosts, and hosts
+    with both A and AAAA records, just work. A family the host lacks is
+    tolerated: that `curl` simply fails (normally at once, at worst
+    after its 2s cap).
   - `connect`: for hosts reached through a port forward on another
     machine, so the ip is on the forwarder, not the host (see
     [Connect checks](#connect-checks)). ssh straight to the ip, and pass
@@ -152,11 +154,11 @@ Supported per-host keys:
   `aws` and `ifconfig` require `curl` and a POSIX login shell on the
   target host.
 
-- `ip_version`: `"4"` or `"6"` — forces the `ifconfig` check's `curl` to
-  that address family (via `curl -4`/`curl -6`). Use it on dual-stack
-  hosts where `ifconfig.me` would otherwise return the family you're not
-  tracking. Only valid with `type: ifconfig`; omit it to let `curl`
-  choose.
+Unknown keys are errors. The old `ip_version` key, which forced the
+`ifconfig` check's `curl` to one family, is no longer supported and is
+now rejected with an error naming the host: `ifconfig` checks query both
+families, so just remove it. (Its forced command has changed too; see
+[Authorized keys](#authorized-keys) for regenerating deployed lines.)
 
 Hosts absent from the config file (or with no `type`) use `iproute2`.
 Config entries for hosts not present on stdin are ignored, so one
@@ -250,9 +252,10 @@ An invalid hostname is likewise skipped with an error. The exit code is
     db.example.com  from="192.0.2.10",restrict,command="ip address; TOKEN=..." ssh-ed25519 AAAA... root@monitor
 
 With **no HOST arguments**, there is one row per check variant instead,
-labelled `iproute2`, `connect`, `aws`, `ifconfig`, `ifconfig-v4` and
-`ifconfig-v6` (the last two being `ifconfig` with `ip_version` 4 and 6)
-— handy for pasting by hand. `-c` is not used in this mode. The
+labelled `iproute2`, `connect`, `aws` and `ifconfig` — one per check
+type, handy for pasting by hand. (Earlier versions also printed
+`ifconfig-v4` and `ifconfig-v6`; every `ifconfig` host now shares the
+one line.) `-c` is not used in this mode. The
 `connect` line is identical to the `iproute2` one, since both run
 `ip address`.
 
@@ -302,10 +305,12 @@ Things to know:
 - **`restrict` needs OpenSSH 7.2 or later on the target.** Older sshd
   doesn't recognise it and ignores the whole line, so the key simply
   stops working there.
-- **Regenerate and redeploy** whenever a host's `type` or `ip_version`
-  changes, or when an ipsentinel upgrade changes its check commands:
-  the forced command wins over whatever ipsentinel asks for, so a stale
-  line keeps running the old command.
+- **Regenerate and redeploy** whenever a host's `type` changes, or when
+  an ipsentinel upgrade changes its check commands: the forced command
+  wins over whatever ipsentinel asks for, so a stale line keeps running
+  the old command. In particular, `ifconfig` lines deployed before it
+  started querying both IPv4 and IPv6 (including any from `ip_version`)
+  must be regenerated.
 - **One key, one job.** Once locked down, the key can only run the check
   command on that host, so anything else using it from the monitoring
   host (rsync, backups, ad-hoc ssh) needs its own key.
