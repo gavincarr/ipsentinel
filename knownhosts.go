@@ -1,0 +1,337 @@
+// The known-hosts command: for each connect: ip host, print known_hosts
+// lines recording the host key already trusted for the host under its ip
+// name. With connect: ip, ssh dials the ip with -o HostName=<ip> and looks
+// the server's key up under the ip name ([ip]:port, or ip on port 22), not
+// under the hostname — so the first `check` run fails every host until the
+// ip name has a key. This command connects to nothing: it copies the keys
+// ssh already trusts for the host to the ip name. A known_hosts line carries
+// only a public key, so this just records "this ip must prove it holds this
+// host's private key"; the next check run's handshake does the verifying.
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/exec"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/alecthomas/kong"
+)
+
+// KnownHostsCmd holds the settings for the known-hosts command. Strip and
+// StripAll mirror CheckCmd's, so the same `-s example.com` that drives check
+// works after the command name.
+type KnownHostsCmd struct {
+	Strip    string `kong:"name='strip',short='s',xor='strip',placeholder='DOMAIN',help='Strip the given domain suffix from each hostname before the ssh check (a leading dot is added if absent, so example.com strips .example.com from foo.example.com => foo).'"`
+	StripAll bool   `kong:"name='strip-all',short='S',xor='strip',help='Strip trailing labels from each hostname, keeping only the leftmost label (foo.example.com => foo).'"`
+}
+
+// AfterApply rejects check flags given before the known-hosts command name
+// (see rejectCheckFlags).
+func (k *KnownHostsCmd) AfterApply(kctx *kong.Context) error {
+	return rejectCheckFlags(kctx, "known-hosts")
+}
+
+// subprocessTimeout bounds each ssh -G and ssh-keygen -F invocation.
+const subprocessTimeout = 10 * time.Second
+
+// knownHostsEnv is the known-hosts command's view of the outside world, so
+// tests can substitute a fake ssh config while still using real ssh-keygen.
+type knownHostsEnv struct {
+	// sshConfig returns `ssh -G` output for hostname; with a non-empty ip it
+	// is resolved as `check` would run it (-o HostName=<ip>).
+	sshConfig func(ctx context.Context, hostname, ip string) (string, error)
+	// keygenFind returns `ssh-keygen -F name -f file` output; "" and a nil
+	// error when the name is not in the file.
+	keygenFind func(ctx context.Context, name, file string) (string, error)
+	// salt returns a fresh 20-byte salt for hashing one known_hosts name.
+	salt func() ([]byte, error)
+}
+
+// realKnownHostsEnv returns the production environment: the real ssh and
+// ssh-keygen binaries, and crypto/rand salts.
+func realKnownHostsEnv() knownHostsEnv {
+	return knownHostsEnv{sshConfig: sshConfig, keygenFind: keygenFind, salt: randomSalt}
+}
+
+// sshConfig runs `ssh -G` for hostname, with the HostName override `check`
+// uses for connect: ip when ip is non-empty, so Match blocks see the same
+// thing. A non-zero exit is an error carrying the trimmed stderr.
+func sshConfig(ctx context.Context, hostname, ip string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, subprocessTimeout)
+	defer cancel()
+	args := []string{"-G"}
+	if ip != "" {
+		args = append(args, "-o", "HostName="+ip)
+	}
+	args = append(args, "--", hostname)
+	return runCaptured(ctx, "ssh", args...)
+}
+
+// keygenFind runs `ssh-keygen -F name -f file`. Exit 1 means the name is not
+// in the file; any other failure is an error.
+func keygenFind(ctx context.Context, name, file string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, subprocessTimeout)
+	defer cancel()
+	out, err := runCaptured(ctx, "ssh-keygen", "-F", name, "-f", file)
+	var ee *exitError
+	if errors.As(err, &ee) && ee.code == 1 {
+		return "", nil
+	}
+	return out, err
+}
+
+// exitError is a non-zero subprocess exit, with its exit code and stderr.
+type exitError struct {
+	cmd    string
+	code   int
+	stderr string
+}
+
+func (e *exitError) Error() string {
+	return fmt.Sprintf("%s exited %d: %s", e.cmd, e.code, e.stderr)
+}
+
+// runCaptured runs name with args and returns its stdout. A non-zero exit
+// is an *exitError; a timeout is reported as such.
+func runCaptured(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if err == nil {
+		return stdout.String(), nil
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("%s timed out after %s", name, subprocessTimeout)
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return stdout.String(), &exitError{name, ee.ExitCode(), strings.TrimSpace(stderr.String())}
+	}
+	return "", err
+}
+
+// randomSalt returns 20 random bytes, the salt size ssh uses (SHA-1 length).
+func randomSalt() ([]byte, error) {
+	salt := make([]byte, sha1.Size)
+	_, err := rand.Read(salt)
+	return salt, err
+}
+
+// parseSSHConfig parses `ssh -G` output: one "key value" per line, keys
+// lowercase. The first occurrence of a key wins, as it does in ssh.
+func parseSSHConfig(out string) map[string]string {
+	m := make(map[string]string)
+	for line := range strings.SplitSeq(out, "\n") {
+		k, v, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if k == "" {
+			continue
+		}
+		if _, ok := m[k]; !ok {
+			m[k] = strings.TrimSpace(v)
+		}
+	}
+	return m
+}
+
+// hostKey is a public key as it appears in known_hosts: type and base64.
+type hostKey struct {
+	typ, key string
+}
+
+// parseKeygenFind parses `ssh-keygen -F` output into keys, in order and
+// deduplicated. Comment ("# Host ... found") and blank lines are skipped, as
+// are @revoked and @cert-authority lines: those must never be copied to
+// another name. The host field may be plain or hashed; it is ignored, as is
+// any trailing comment.
+func parseKeygenFind(out string) []hostKey {
+	var keys []hostKey
+	seen := make(map[hostKey]bool)
+	for line := range strings.SplitSeq(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if strings.HasPrefix(f[0], "@") {
+			continue
+		}
+		if len(f) < 3 {
+			continue
+		}
+		k := hostKey{f[1], f[2]}
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// knownHostsName returns the name ssh files host's key under: the host
+// itself on port 22, else [host]:port (IPv6 included).
+func knownHostsName(host, port string) string {
+	if port == "22" {
+		return host
+	}
+	return "[" + host + "]:" + port
+}
+
+// hashKnownHostsName returns name in ssh's hashed known_hosts form,
+// |1|base64(salt)|base64(HMAC-SHA1(key=salt, msg=name)).
+func hashKnownHostsName(name string, salt []byte) string {
+	mac := hmac.New(sha1.New, salt)
+	mac.Write([]byte(name))
+	return "|1|" + base64.StdEncoding.EncodeToString(salt) + "|" + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// findKeys returns the keys recorded for name across files, deduplicated.
+// Files that do not exist are skipped, since ssh-keygen -F fails on them.
+func findKeys(ctx context.Context, env knownHostsEnv, name string, files []string) ([]hostKey, error) {
+	var keys []hostKey
+	seen := make(map[hostKey]bool)
+	for _, f := range files {
+		if _, err := os.Stat(f); err != nil {
+			continue
+		}
+		out, err := env.keygenFind(ctx, name, f)
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range parseKeygenFind(out) {
+			if !seen[k] {
+				seen[k] = true
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys, nil
+}
+
+// runKnownHosts implements the known-hosts command: it reads checks like
+// run does and, for each connect: ip host, writes to w known_hosts lines
+// copying the host's trusted keys to its ip name (see the file comment).
+// Keys already recorded under the ip name are not repeated, so a re-run
+// prints nothing new; keys printed earlier in this run count as recorded.
+// A host with ssh -G failing, no known key, or an ip name already holding a
+// key that is not one of the host's is a problem: it is logged, nothing is
+// printed for it, and the exit code is 1. stdout carries only known_hosts
+// lines. Returns the exit code.
+func runKnownHosts(r io.Reader, stripAll bool, domain string, config Config, log *slog.Logger,
+	w io.Writer, env knownHostsEnv) int {
+	ctx := context.Background()
+	checks, problems := parseInput(r, LogAlerter{log}, stripAll, domain, config)
+	// Keys printed this run, by plain ip name.
+	printed := make(map[string][]hostKey)
+	var lines int
+
+	for _, c := range checks {
+		if c.Connect != connectIP {
+			log.Debug("not connect: ip; skipping", "hostname", c.Hostname, "ip", c.IP)
+			continue
+		}
+		n, ok := knownHostsFor(ctx, c, env, log, w, printed)
+		lines += n
+		if !ok {
+			problems++
+		}
+	}
+
+	if problems > 0 {
+		log.Warn("finished with problems", "lines", lines, "problems", problems)
+		return 1
+	}
+	log.Info("known_hosts lines printed", "lines", lines)
+	return 0
+}
+
+// knownHostsFor handles one connect: ip check, returning the number of
+// lines printed and whether it went without a problem (already logged).
+func knownHostsFor(ctx context.Context, c Check, env knownHostsEnv, log *slog.Logger,
+	w io.Writer, printed map[string][]hostKey) (int, bool) {
+	ipOut, err := env.sshConfig(ctx, c.Hostname, c.IP)
+	if err != nil {
+		log.Error("ssh -G failed", "hostname", c.Hostname, "ip", c.IP, "err", err)
+		return 0, false
+	}
+	ipSide := parseSSHConfig(ipOut)
+	if alias := ipSide["hostkeyalias"]; alias != "" && alias != "none" {
+		log.Debug("hostkeyalias set; ssh already verifies the ip against it, skipping",
+			"hostname", c.Hostname, "ip", c.IP, "hostkeyalias", alias)
+		return 0, true
+	}
+	hostOut, err := env.sshConfig(ctx, c.Hostname, "")
+	if err != nil {
+		log.Error("ssh -G failed", "hostname", c.Hostname, "ip", c.IP, "err", err)
+		return 0, false
+	}
+	hostSide := parseSSHConfig(hostOut)
+	hostName := knownHostsName(hostSide["hostname"], hostSide["port"])
+	ipName := knownHostsName(c.IP, ipSide["port"])
+
+	// The ip side's files are the ones ssh consults for the ip connection.
+	files := append(strings.Fields(ipSide["userknownhostsfile"]), strings.Fields(ipSide["globalknownhostsfile"])...)
+
+	hostKeys, err := findKeys(ctx, env, hostName, files)
+	if err != nil {
+		log.Error("looking up host key failed", "hostname", c.Hostname, "ip", c.IP, "name", hostName, "err", err)
+		return 0, false
+	}
+	if len(hostKeys) == 0 {
+		log.Error("no known host key for host; add it by hand, see README",
+			"hostname", c.Hostname, "ip", c.IP, "name", hostName)
+		return 0, false
+	}
+	ipKeys, err := findKeys(ctx, env, ipName, files)
+	if err != nil {
+		log.Error("looking up ip key failed", "hostname", c.Hostname, "ip", c.IP, "name", ipName, "err", err)
+		return 0, false
+	}
+	ipKeys = append(ipKeys, printed[ipName]...)
+	for _, k := range ipKeys {
+		if !slices.Contains(hostKeys, k) {
+			log.Error("ip already has a different host key; not adding",
+				"hostname", c.Hostname, "ip", c.IP, "name", ipName)
+			return 0, false
+		}
+	}
+
+	hash := ipSide["hashknownhosts"] == "yes"
+	var n int
+	for _, k := range hostKeys {
+		if slices.Contains(ipKeys, k) {
+			continue
+		}
+		field := ipName
+		if hash {
+			salt, err := env.salt()
+			if err != nil {
+				log.Error("generating salt failed", "hostname", c.Hostname, "ip", c.IP, "err", err)
+				return n, false
+			}
+			field = hashKnownHostsName(ipName, salt)
+		}
+		if _, err := fmt.Fprintf(w, "%s %s %s\n", field, k.typ, k.key); err != nil {
+			log.Error("writing output", "err", err)
+			return n, false
+		}
+		printed[ipName] = append(printed[ipName], k)
+		n++
+	}
+	if n == 0 {
+		log.Debug("already recorded", "hostname", c.Hostname, "ip", c.IP, "name", ipName)
+	}
+	return n, true
+}

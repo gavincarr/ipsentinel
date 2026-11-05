@@ -44,6 +44,7 @@ type CLI struct {
 	// still works.
 	Check          CheckCmd          `kong:"cmd,name='check',default='withargs',help='Check each hostname,ip pair on stdin via ssh, alerting on any failure (the default command).'"`
 	AuthorizedKeys AuthorizedKeysCmd `kong:"cmd,name='authorized-keys',help='Run no checks, and read no stdin. Instead print a table of authorized_keys lines that lock the key down to exactly the command ipsentinel would run: one per HOST given, or one per check variant if none. Requires OpenSSH 7.2+ on the targets; see README.'"`
+	KnownHosts     KnownHostsCmd     `kong:"cmd,name='known-hosts',help='Run no checks and connect to nothing. Instead, for each connect: ip hostname,ip pair on stdin, print known_hosts lines recording the host key already trusted for the host under its ip name ([ip]:port, or ip on port 22), ready to append to known_hosts. See README.'"`
 }
 
 // CheckCmd holds the settings for the check command.
@@ -67,10 +68,16 @@ type AuthorizedKeysCmd struct {
 }
 
 // AfterApply rejects check flags given before the authorized-keys command
-// name. Because check is the "withargs" default, kong accepts its flags
-// ahead of any command, so `ipsentinel -s x authorized-keys k.pub` would
-// otherwise parse and silently ignore -s.
+// name (see rejectCheckFlags).
 func (a *AuthorizedKeysCmd) AfterApply(kctx *kong.Context) error {
+	return rejectCheckFlags(kctx, "authorized-keys")
+}
+
+// rejectCheckFlags rejects check flags given before the name of another
+// command, cmdName. Because check is the "withargs" default, kong accepts
+// its flags ahead of any command, so `ipsentinel -s x authorized-keys k.pub`
+// would otherwise parse and silently ignore -s.
+func rejectCheckFlags(kctx *kong.Context, cmdName string) error {
 	var check *kong.Node
 	for _, n := range kctx.Model.Children {
 		if n.Name == "check" {
@@ -82,7 +89,7 @@ func (a *AuthorizedKeysCmd) AfterApply(kctx *kong.Context) error {
 	}
 	for _, p := range kctx.Path {
 		if p.Flag != nil && slices.Contains(check.Flags, p.Flag) {
-			return fmt.Errorf("--%s is a check flag and cannot be used with authorized-keys", p.Flag.Name)
+			return fmt.Errorf("--%s is a check flag and cannot be used with %s", p.Flag.Name, cmdName)
 		}
 	}
 	return nil
@@ -225,6 +232,8 @@ func main() {
 			os.Exit(1)
 		}
 		os.Exit(runAuthorizedKeys(cli.AuthorizedKeys.Hosts, config, log, os.Stdout, pubkey, from))
+	case "known-hosts":
+		os.Exit(runKnownHosts(os.Stdin, cli.KnownHosts.StripAll, cli.KnownHosts.Strip, config, log, os.Stdout, realKnownHostsEnv()))
 	default:
 		log.Error("unknown command", "command", kctx.Command())
 		os.Exit(1)

@@ -541,6 +541,7 @@ func TestCLIGrammar(t *testing.T) {
 		checkCmd   = "check"
 		akCmd      = "authorized-keys <pubkey>"
 		akHostsCmd = "authorized-keys <pubkey> <host>"
+		khCmd      = "known-hosts"
 	)
 	defaults := CLI{ConnectDefault: "ssh_config", Check: CheckCmd{Concurrency: 8, Timeout: 10 * time.Second, Retries: 2, RetryDelay: 5 * time.Second}}
 	with := func(f func(*CLI)) CLI {
@@ -625,6 +626,21 @@ func TestCLIGrammar(t *testing.T) {
 			with(func(c *CLI) {
 				c.AuthorizedKeys = AuthorizedKeysCmd{Pubkey: "/root/.ssh/id_ipsentinel.pub", From: "192.0.2.10,!10.0.0.1"}
 			}), akCmd},
+		{"known-hosts strip", []string{"known-hosts", "-s", "example.com"},
+			with(func(c *CLI) { c.KnownHosts.Strip = "example.com" }), khCmd},
+		{"known-hosts strip-all", []string{"known-hosts", "-S"},
+			with(func(c *CLI) { c.KnownHosts.StripAll = true }), khCmd},
+		{"known-hosts with root flags", []string{"-c", "cfg", "--connect-default=ip", "known-hosts", "-v", "-s", "x"},
+			with(func(c *CLI) {
+				c.Config = "cfg"
+				c.ConnectDefault = "ip"
+				c.Verbose = 1
+				c.KnownHosts.Strip = "x"
+			}), khCmd},
+		{"check strip unaffected by known-hosts", []string{"check", "-s", "x"},
+			with(func(c *CLI) { c.Check.Strip = "x" }), checkCmd},
+		{"bare strip still check", []string{"-s", "x"},
+			with(func(c *CLI) { c.Check.Strip = "x" }), checkCmd},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -666,6 +682,12 @@ func TestCLIGrammarErrors(t *testing.T) {
 		{"strip before authorized-keys", []string{"-s", "x", "authorized-keys", "k.pub"}},
 		{"strip-all before authorized-keys", []string{"-S", "authorized-keys", "k.pub"}},
 		{"identity before authorized-keys", []string{"-i", "k", "authorized-keys", "k.pub", "h"}},
+		{"strip before known-hosts", []string{"-s", "x", "known-hosts"}},
+		{"strip-all before known-hosts", []string{"-S", "known-hosts"}},
+		{"identity before known-hosts", []string{"-i", "k", "known-hosts"}},
+		{"identity under known-hosts", []string{"known-hosts", "-i", "k"}},
+		{"known-hosts strip xor strip-all", []string{"known-hosts", "-s", "x", "-S"}},
+		{"known-hosts takes no args", []string{"known-hosts", "web1"}},
 		{"authorized-keys missing pubkey", []string{"authorized-keys"}},
 		{"from without authorized-keys", []string{"--from", "192.0.2.1"}},
 		{"from under check", []string{"check", "--from", "192.0.2.1"}},
@@ -723,5 +745,28 @@ func TestCLIFromEnv(t *testing.T) {
 				t.Errorf("From = %q, want %q", cli.AuthorizedKeys.From, tt.want)
 			}
 		})
+	}
+}
+
+// TestCheckFlagRejectionMessage pins the error for check flags given before
+// a non-check command name, which names the flag and the command.
+func TestCheckFlagRejectionMessage(t *testing.T) {
+	for _, tt := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"-s", "x", "known-hosts"}, "--strip is a check flag and cannot be used with known-hosts"},
+		{[]string{"-S", "known-hosts"}, "--strip-all is a check flag and cannot be used with known-hosts"},
+		{[]string{"-s", "x", "authorized-keys", "k.pub"}, "--strip is a check flag and cannot be used with authorized-keys"},
+	} {
+		var cli CLI
+		parser, err := kong.New(&cli)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = parser.Parse(tt.args)
+		if err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("Parse(%q) error = %v, want containing %q", tt.args, err, tt.want)
+		}
 	}
 }
