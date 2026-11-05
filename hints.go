@@ -18,16 +18,27 @@ const reasonHostKeyNotRecorded = "host key not recorded for ip"
 const firstRunMinFailures = 3
 
 // unknownHostKey reports whether err is ssh refusing a host whose key it has
-// no record of, as opposed to a changed or revoked key. ssh says
-// "Host key verification failed" for both, but wraps every changed, revoked
-// or mismatched case in an @@@ banner and never an unknown key, so the
-// banner is what separates the real alarms from the first-run noise.
+// no record of, as opposed to a changed, revoked or mismatched key. ssh says
+// "Host key verification failed" for all of them, but wraps most alarms in
+// an @@@ banner and never an unknown key. The exception is a server
+// presenting a key of a different type from the one recorded (a possible
+// downgrade): OpenSSH prints no banner, only "WARNING: ED25519 key found for
+// host ..." or "... but keys of different type are already known". Those two
+// phrases are alarms too, so they count as known keys, not unknown ones.
 func unknownHostKey(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "host key verification failed") && !strings.Contains(msg, "@@@")
+	if !strings.Contains(msg, "host key verification failed") {
+		return false
+	}
+	for _, alarm := range []string{"@@@", "key found for host", "keys of different type are already known"} {
+		if strings.Contains(msg, alarm) {
+			return false
+		}
+	}
+	return true
 }
 
 // unknownKeyChecks collects, concurrently, the checks alerted as unknown

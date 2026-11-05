@@ -47,6 +47,8 @@ func TestUnknownHostKey(t *testing.T) {
 		{"changed key", errors.New("ssh failed: @@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@\nHost key verification failed."), false},
 		{"revoked key", errors.New("ssh failed: @@@@@@@@\n@       WARNING: REVOKED HOST KEY DETECTED!               @\n@@@@@@@@\nHost key verification failed."), false},
 		{"dns spoofing", errors.New("ssh failed: @@@\nWARNING: POSSIBLE DNS SPOOFING DETECTED!\nHost key verification failed."), false},
+		{"different key type", errors.New("ssh failed: WARNING: ED25519 key found for host 192.0.2.1\nin /h/.ssh/known_hosts:3\nED25519 key fingerprint SHA256:abc.\nHost key verification failed."), false},
+		{"different type known", errors.New("ssh failed: No ECDSA host key is known for 192.0.2.1 but keys of different type are already known for this host.\nHost key verification failed."), false},
 		{"other error", errors.New("ssh failed: Permission denied (publickey)."), false},
 	}
 	for _, tt := range tests {
