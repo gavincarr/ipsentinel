@@ -59,7 +59,7 @@ type CheckCmd struct {
 type AuthorizedKeysCmd struct {
 	Pubkey string   `kong:"arg,name='pubkey',placeholder='PUBKEY',help='OpenSSH public key file to lock down (the .pub, not the private key).'"`
 	Hosts  []string `kong:"arg,optional,name='host',placeholder='HOST',help='Hosts to generate lines for, labelled exactly as given. Each is matched to a config entry by exact key, else by the keys starting with HOST followed by a dot (which must agree on the forced command). With none, print one line per check variant instead.'"`
-	From   string   `kong:"name='from',placeholder='PATTERNS',help='Comma-separated sshd from= patterns (IPs, CIDRs, hostname patterns, !negations) restricting where the key may be used from.'"`
+	From   string   `kong:"name='from',env='IPSENTINEL_FROM',placeholder='PATTERNS',help='Comma-separated sshd from= patterns (IPs, CIDRs, hostname patterns, !negations) restricting where the key may be used from. An explicit --from overrides the environment variable.'"`
 }
 
 // AfterApply rejects check flags given before the authorized-keys command
@@ -190,17 +190,6 @@ func main() {
 	cli.Check.Concurrency = max(cli.Check.Concurrency, 1)
 	cli.Check.Retries = max(cli.Check.Retries, 0)
 
-	// --from can only be set under authorized-keys (kong scopes it there).
-	var from []string
-	if cli.AuthorizedKeys.From != "" {
-		var err error
-		from, err = parseFrom(cli.AuthorizedKeys.From)
-		if err != nil {
-			log.Error("parsing --from", "err", err)
-			os.Exit(1)
-		}
-	}
-
 	var config map[string]HostConfig
 	if cli.Config != "" {
 		var err error
@@ -215,6 +204,17 @@ func main() {
 	case "check":
 		os.Exit(run(cli, config, log, os.Stdin))
 	case "authorized-keys":
+		// Parsed only here: kong may fill From from $IPSENTINEL_FROM whatever
+		// the command, and a bad value must not break check runs.
+		var from []string
+		if cli.AuthorizedKeys.From != "" {
+			var err error
+			from, err = parseFrom(cli.AuthorizedKeys.From)
+			if err != nil {
+				log.Error("parsing --from / IPSENTINEL_FROM", "err", err)
+				os.Exit(1)
+			}
+		}
 		pubkey, err := loadPubkey(cli.AuthorizedKeys.Pubkey)
 		if err != nil {
 			log.Error("loading public key", "err", err)

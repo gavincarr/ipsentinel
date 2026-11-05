@@ -518,7 +518,7 @@ func TestRunAuthorizedKeysFromWarning(t *testing.T) {
 					t.Errorf("hosts %q: exit = %d, want 0", hosts, exit)
 				}
 				gotWarn := strings.Contains(stderr.String(), "level=WARN") &&
-					strings.Contains(stderr.String(), "no --from given")
+					strings.Contains(stderr.String(), "no --from or IPSENTINEL_FROM given")
 				if gotWarn != tt.warn {
 					t.Errorf("hosts %q: --from warning = %v, want %v; stderr:\n%s", hosts, gotWarn, tt.warn, stderr.String())
 				}
@@ -668,6 +668,41 @@ func TestCLIGrammarErrors(t *testing.T) {
 			}
 			if _, err := parser.Parse(tt.args); err == nil {
 				t.Errorf("Parse(%q) succeeded, want error; got %+v", tt.args, cli)
+			}
+		})
+	}
+}
+
+// TestCLIFromEnv pins IPSENTINEL_FROM as the default for --from: used when
+// the flag is absent, overridden by an explicit --from, and harmless (not
+// parsed by main) under check.
+func TestCLIFromEnv(t *testing.T) {
+	t.Setenv("IPSENTINEL_FROM", "192.0.2.10,10.0.0.0/8")
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+		cmd  string
+	}{
+		{"env used when flag absent", []string{"authorized-keys", "k.pub", "h"}, "192.0.2.10,10.0.0.0/8", "authorized-keys"},
+		{"flag overrides env", []string{"authorized-keys", "--from", "198.51.100.1", "k.pub"}, "198.51.100.1", "authorized-keys"},
+		{"check still parses with env set", []string{"-i", "k", "-c", "cfg"}, "", "check"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var cli CLI
+			parser, err := kong.New(&cli)
+			if err != nil {
+				t.Fatalf("kong.New: %v", err)
+			}
+			kctx, err := parser.Parse(tt.args)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tt.args, err)
+			}
+			if got := kctx.Selected().Name; got != tt.cmd {
+				t.Fatalf("selected = %q, want %q", got, tt.cmd)
+			}
+			if tt.cmd == "authorized-keys" && cli.AuthorizedKeys.From != tt.want {
+				t.Errorf("From = %q, want %q", cli.AuthorizedKeys.From, tt.want)
 			}
 		})
 	}

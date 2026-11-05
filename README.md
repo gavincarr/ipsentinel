@@ -259,7 +259,15 @@ labelled `iproute2`, `connect`, `aws`, `ifconfig`, `ifconfig-v4` and
 `--from PATTERNS` adds an sshd `from=` restriction: a comma-separated
 list of the addresses, CIDRs or hostname patterns (with `!` negation)
 the key may be used from — normally the monitoring host's address(es).
-Without it, a warning is logged on stderr, since the generated lines
+If `--from` isn't given, the `IPSENTINEL_FROM` environment variable is
+used instead, so the usual list can be set once — exported in your
+shell, or in a `.env`/`.env.local` file in the directory you run
+ipsentinel from (both are loaded at startup):
+
+    IPSENTINEL_FROM=104.237.141.63,192.168.188.199,100.66.118.30
+
+An explicit `--from` always overrides it (e.g. for hosts behind a
+forward, below). With neither, a warning is logged on stderr, since the generated lines
 then accept the key from any address; the output is still produced and
 the exit code unaffected.
 

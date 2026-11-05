@@ -242,13 +242,13 @@ func resolveHost(host string, config map[string]HostConfig) (Check, error) {
 // writes one row per distinct host (first-seen order), labelled as given and
 // resolved against config by resolveHost; an invalid or unresolvable host is
 // logged and skipped. Without hosts, it writes one row per check variant
-// (see checkVariants), ignoring config. A missing --from is warned about,
+// (see checkVariants), ignoring config. A missing --from (or IPSENTINEL_FROM) is warned about,
 // since the lines then accept the key from anywhere. Returns the exit code:
 // 1 if any host was skipped, else 0.
 func runAuthorizedKeys(hosts []string, config map[string]HostConfig, log *slog.Logger,
 	w io.Writer, pubkey string, from []string) int {
 	if len(from) == 0 {
-		log.Warn("no --from given; generated lines allow the key from any address")
+		log.Warn("no --from or IPSENTINEL_FROM given; generated lines allow the key from any address")
 	}
 
 	var rows []akRow
