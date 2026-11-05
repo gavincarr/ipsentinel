@@ -96,13 +96,18 @@ func knownHostsCommand(cli CLI) string {
 // the checks alerted as unknown host keys and total the connect: ip checks
 // in the run. Each unknown check is diagnosed with the same local-only logic
 // as `known-hosts` (nothing is connected to): fixable by known-hosts, having
-// no known key at all, or something else, which gets no line of its own.
+// no known key at all, an ip that already holds a different key (an alarm to
+// investigate), or something else (aliased, revoked, lookup error), which
+// gets no line of its own.
 func logHostKeyHints(ctx context.Context, cli CLI, unknown []Check, total int, log *slog.Logger, env knownHostsEnv) {
 	n := len(unknown)
 	if n == 0 {
 		return
 	}
-	var fixable, noKey int
+	// Diagnosis runs ssh -G and ssh-keygen per host, sequentially, which
+	// can take a while on a big input.
+	log.Info(fmt.Sprintf("diagnosing %d hosts with unrecorded ip host keys", n))
+	var fixable, noKey, alarm int
 	files := make(map[string]bool)
 	for _, c := range unknown {
 		switch p := planHostKeys(ctx, c, env, nil); p.status {
@@ -111,6 +116,11 @@ func logHostKeyHints(ctx context.Context, cli CLI, unknown []Check, total int, l
 			files[p.ipUserFile] = true
 		case hostKeyNoHostKey:
 			noKey++
+		case hostKeyRecorded, hostKeyForeignIPKey:
+			// A key is recorded under the ip, yet ssh found none matching
+			// it: a changed key that the stderr classifier can't see (e.g.
+			// StrictHostKeyChecking=yes prints no warning for a type switch).
+			alarm++
 		}
 	}
 
@@ -124,12 +134,17 @@ func logHostKeyHints(ctx context.Context, cli CLI, unknown []Check, total int, l
 		} else {
 			cmd += " and append its output to your known_hosts"
 		}
-		log.Warn(fmt.Sprintf("%d can be fixed with: %s", fixable, cmd))
+		log.Warn(fmt.Sprintf("%d can be fixed by piping the same input to: %s", fixable, cmd))
 	}
 	if noKey > 0 {
 		log.Warn(fmt.Sprintf(`%d have no known key at all; add them by hand, see README "connect: ip"`, noKey))
 	}
-	if n >= firstRunMinFailures && 2*n >= total {
+	if alarm > 0 {
+		log.Warn(fmt.Sprintf("%d already have a different key recorded under the ip; investigate, this may be a changed key", alarm))
+	}
+	// Explicit connect: ip entries win over --connect-default, so the flag
+	// is no use when the run already defaults to ssh_config.
+	if n >= firstRunMinFailures && 2*n >= total && cli.ConnectDefault != connectSSHConfig {
 		log.Warn("to check by hostname instead, pass --connect-default=ssh_config")
 	}
 }

@@ -130,6 +130,9 @@ func sameFile(_ int, shared string) string { return shared }
 func TestLogHostKeyHints(t *testing.T) {
 	const line1 = "WARN %d of %d connect: ip hosts failed: host key not recorded under the ip yet"
 	const line4 = "WARN to check by hostname instead, pass --connect-default=ssh_config"
+	lineAlarm := func(r int) string {
+		return fmt.Sprintf("WARN %d already have a different key recorded under the ip; investigate, this may be a changed key", r)
+	}
 	cli := CLI{Config: "ipsentinel.yml", ConnectDefault: "ip", Check: CheckCmd{Strip: "example.com"}}
 	tests := []struct {
 		name              string
@@ -144,12 +147,12 @@ func TestLogHostKeyHints(t *testing.T) {
 		{name: "one fixable", fix: 1, total: 10, cli: cli, file: sameFile,
 			want: func(s string) []string {
 				return []string{fmt.Sprintf(line1, 1, 10),
-					"WARN 1 can be fixed with: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> " + s}
+					"WARN 1 can be fixed by piping the same input to: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> " + s}
 			}},
 		{name: "mixed fixable and no key", fix: 2, noKey: 1, total: 20, cli: cli, file: sameFile,
 			want: func(s string) []string {
 				return []string{fmt.Sprintf(line1, 3, 20),
-					"WARN 2 can be fixed with: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> " + s,
+					"WARN 2 can be fixed by piping the same input to: ipsentinel known-hosts -c ipsentinel.yml -s example.com >> " + s,
 					`WARN 1 have no known key at all; add them by hand, see README "connect: ip"`}
 			}},
 		{name: "only no key", noKey: 2, total: 2, cli: cli, file: sameFile,
@@ -157,19 +160,30 @@ func TestLogHostKeyHints(t *testing.T) {
 				return []string{fmt.Sprintf(line1, 2, 2),
 					`WARN 2 have no known key at all; add them by hand, see README "connect: ip"`}
 			}},
-		{name: "other only gets no own line", other: 1, total: 1, cli: cli, file: sameFile,
-			want: func(string) []string { return []string{fmt.Sprintf(line1, 1, 1)} }},
+		{name: "recorded key is an alarm", other: 2, fix: 1, total: 3, cli: CLI{ConnectDefault: "ip"}, file: sameFile,
+			want: func(s string) []string {
+				return []string{fmt.Sprintf(line1, 3, 3),
+					"WARN 1 can be fixed by piping the same input to: ipsentinel known-hosts >> " + s,
+					lineAlarm(2), line4}
+			}},
+		{name: "alarm line precedes ssh_config line", other: 3, total: 3, cli: CLI{ConnectDefault: "ip"}, file: sameFile,
+			want: func(string) []string { return []string{fmt.Sprintf(line1, 3, 3), lineAlarm(3), line4} }},
+		{name: "default already ssh_config: no line 4", fix: 3, total: 3, cli: CLI{ConnectDefault: "ssh_config"}, file: sameFile,
+			want: func(s string) []string {
+				return []string{fmt.Sprintf(line1, 3, 3),
+					"WARN 3 can be fixed by piping the same input to: ipsentinel known-hosts --connect-default=ssh_config >> " + s}
+			}},
 		{name: "N=2 of 2: no line 4", fix: 2, total: 2, cli: CLI{ConnectDefault: "ip"}, file: sameFile,
 			want: func(s string) []string {
-				return []string{fmt.Sprintf(line1, 2, 2), "WARN 2 can be fixed with: ipsentinel known-hosts >> " + s}
+				return []string{fmt.Sprintf(line1, 2, 2), "WARN 2 can be fixed by piping the same input to: ipsentinel known-hosts >> " + s}
 			}},
 		{name: "N=3 of 6: line 4", fix: 3, total: 6, cli: CLI{ConnectDefault: "ip"}, file: sameFile,
 			want: func(s string) []string {
-				return []string{fmt.Sprintf(line1, 3, 6), "WARN 3 can be fixed with: ipsentinel known-hosts >> " + s, line4}
+				return []string{fmt.Sprintf(line1, 3, 6), "WARN 3 can be fixed by piping the same input to: ipsentinel known-hosts >> " + s, line4}
 			}},
 		{name: "N=3 of 7: no line 4", fix: 3, total: 7, cli: CLI{ConnectDefault: "ip"}, file: sameFile,
 			want: func(s string) []string {
-				return []string{fmt.Sprintf(line1, 3, 7), "WARN 3 can be fixed with: ipsentinel known-hosts >> " + s}
+				return []string{fmt.Sprintf(line1, 3, 7), "WARN 3 can be fixed by piping the same input to: ipsentinel known-hosts >> " + s}
 			}},
 		{name: "differing files", fix: 2, total: 2, cli: CLI{ConnectDefault: "ip"},
 			file: func(i int, shared string) string {
@@ -180,12 +194,12 @@ func TestLogHostKeyHints(t *testing.T) {
 			},
 			want: func(string) []string {
 				return []string{fmt.Sprintf(line1, 2, 2),
-					"WARN 2 can be fixed with: ipsentinel known-hosts and append its output to your known_hosts"}
+					"WARN 2 can be fixed by piping the same input to: ipsentinel known-hosts and append its output to your known_hosts"}
 			}},
 		{name: "ssh_config default echoed", fix: 1, total: 1, cli: CLI{ConnectDefault: "ssh_config", Check: CheckCmd{StripAll: true}}, file: sameFile,
 			want: func(s string) []string {
 				return []string{fmt.Sprintf(line1, 1, 1),
-					"WARN 1 can be fixed with: ipsentinel known-hosts --connect-default=ssh_config -S >> " + s}
+					"WARN 1 can be fixed by piping the same input to: ipsentinel known-hosts --connect-default=ssh_config -S >> " + s}
 			}},
 	}
 	for _, tt := range tests {
@@ -193,7 +207,11 @@ func TestLogHostKeyHints(t *testing.T) {
 			checks, env, shared := hintHosts(t, tt.fix, tt.noKey, tt.other, tt.file)
 			log, got := newMsgLogger()
 			logHostKeyHints(context.Background(), tt.cli, checks, tt.total, log, env)
-			if want := tt.want(shared); !reflect.DeepEqual(got(), want) {
+			want := tt.want(shared)
+			if len(want) > 0 {
+				want = append([]string{fmt.Sprintf("INFO diagnosing %d hosts with unrecorded ip host keys", len(checks))}, want...)
+			}
+			if !reflect.DeepEqual(got(), want) {
 				t.Errorf("got:\n%s\nwant:\n%s", strings.Join(got(), "\n"), strings.Join(want, "\n"))
 			}
 		})
@@ -207,7 +225,7 @@ func TestLogHostKeyHintsQuotesConfigAndFile(t *testing.T) {
 	// The temp path has no spaces, so only the config path needs quoting.
 	log, got := newMsgLogger()
 	logHostKeyHints(context.Background(), CLI{Config: "/my dir/c.yml", ConnectDefault: "ip"}, checks, 1, log, env)
-	if len(got()) != 2 || !strings.Contains(got()[1], "known-hosts -c '/my dir/c.yml' >> ") {
+	if len(got()) != 3 || !strings.Contains(got()[2], "known-hosts -c '/my dir/c.yml' >> ") {
 		t.Errorf("got %v", got())
 	}
 }
@@ -241,9 +259,35 @@ func TestRunWithHints(t *testing.T) {
 		t.Errorf("reasons = %v, want %v", reasons, want)
 	}
 	msgs := got()
-	if len(msgs) < 3 || msgs[len(msgs)-2] != "WARN 1 of 3 connect: ip hosts failed: host key not recorded under the ip yet" ||
-		!strings.HasPrefix(msgs[len(msgs)-1], "WARN 1 can be fixed with: ipsentinel known-hosts") ||
-		msgs[len(msgs)-3] != "WARN finished with failures" {
+	if len(msgs) < 4 || msgs[len(msgs)-4] != "WARN finished with failures" ||
+		msgs[len(msgs)-3] != "INFO diagnosing 1 hosts with unrecorded ip host keys" ||
+		msgs[len(msgs)-2] != "WARN 1 of 3 connect: ip hosts failed: host key not recorded under the ip yet" ||
+		!strings.HasPrefix(msgs[len(msgs)-1], "WARN 1 can be fixed by piping the same input to: ipsentinel known-hosts") {
 		t.Errorf("msgs = %q", msgs)
+	}
+}
+
+// TestLogHostKeyHintsLookupError checks a host whose diagnosis fails (ssh -G
+// erroring) is counted in N but gets no line of its own, and doesn't stop
+// the other hosts being diagnosed.
+func TestLogHostKeyHintsLookupError(t *testing.T) {
+	checks, env, shared := hintHosts(t, 1, 0, 0, sameFile)
+	checks = append([]Check{{Hostname: "broken", IP: "192.0.2.99", Connect: connectIP}}, checks...)
+	good := env.sshConfig
+	env.sshConfig = func(ctx context.Context, hostname, ip string) (string, error) {
+		if hostname == "broken" {
+			return "", errors.New("ssh -G: exit status 255")
+		}
+		return good(ctx, hostname, ip)
+	}
+	log, got := newMsgLogger()
+	logHostKeyHints(context.Background(), CLI{ConnectDefault: "ip"}, checks, 2, log, env)
+	want := []string{
+		"INFO diagnosing 2 hosts with unrecorded ip host keys",
+		"WARN 2 of 2 connect: ip hosts failed: host key not recorded under the ip yet",
+		"WARN 1 can be fixed by piping the same input to: ipsentinel known-hosts >> " + shared,
+	}
+	if !reflect.DeepEqual(got(), want) {
+		t.Errorf("got:\n%s\nwant:\n%s", strings.Join(got(), "\n"), strings.Join(want, "\n"))
 	}
 }
