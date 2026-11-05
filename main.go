@@ -253,7 +253,24 @@ func run(cli CLI, config Config, log *slog.Logger, r io.Reader) int {
 	// Info: with the closing summary, this is the pair -v exists to show.
 	log.Info("parsed input", "checks", len(checks))
 
-	return runChecks(context.Background(), cli.Check, checks, parseFailures, alerter, log, runCheckWith(cli.Check.Identity))
+	return runWith(cli, checks, parseFailures, alerter, log, runCheckWith(cli.Check.Identity), realKnownHostsEnv())
+}
+
+// runWith runs checks, then closes with the unknown-host-key hint (see
+// logHostKeyHints) so it is the last output. checkFn and env are injectable
+// for tests.
+func runWith(cli CLI, checks []Check, parseFailures int, alerter Alerter, log *slog.Logger,
+	checkFn checker, env knownHostsEnv) int {
+	ctx := context.Background()
+	code, unknown := runChecks(ctx, cli.Check, checks, parseFailures, alerter, log, checkFn)
+	var ipChecks int
+	for _, c := range checks {
+		if c.Connect == connectIP {
+			ipChecks++
+		}
+	}
+	logHostKeyHints(ctx, cli, unknown, ipChecks, log, env)
+	return code
 }
 
 // parseInput reads hostname,ip pairs from r, one per line. Blank lines and
@@ -405,13 +422,15 @@ type checker func(ctx context.Context, timeout time.Duration, c Check) error
 // failure still failing after the last pass is alerted (reason "check failed
 // (after retries)") and counted. Returns the process exit code: 0 iff every
 // check ultimately passed. parseFailures pre-seeds the failure count and is
-// excluded from the success tally.
+// excluded from the success tally. Also returns the connect: ip checks that
+// failed with an unknown host key (reason "host key not recorded for ip").
 func runChecks(ctx context.Context, cmd CheckCmd, checks []Check, parseFailures int,
-	alerter Alerter, log *slog.Logger, checkFn checker) int {
+	alerter Alerter, log *slog.Logger, checkFn checker) (int, []Check) {
+	var unknown unknownKeyChecks
 	var failures atomic.Int64
 	failures.Add(int64(parseFailures))
 
-	soft := runPass(ctx, cmd, checks, checkFn, alerter, log, &failures)
+	soft := runPass(ctx, cmd, checks, checkFn, alerter, log, &failures, &unknown)
 	for attempt := 1; attempt <= cmd.Retries && len(soft) > 0; attempt++ {
 		if delay := cmd.RetryDelay * time.Duration(1<<(attempt-1)); delay > 0 {
 			time.Sleep(delay)
@@ -421,7 +440,7 @@ func runChecks(ctx context.Context, cmd CheckCmd, checks []Check, parseFailures 
 		for i, sf := range soft {
 			retry[i] = sf.c
 		}
-		soft = runPass(ctx, cmd, retry, checkFn, alerter, log, &failures)
+		soft = runPass(ctx, cmd, retry, checkFn, alerter, log, &failures, &unknown)
 	}
 	for _, sf := range soft {
 		alerter.Alert(sf.c, "check failed (after retries)", sf.err)
@@ -434,18 +453,20 @@ func runChecks(ctx context.Context, cmd CheckCmd, checks []Check, parseFailures 
 		// Warn, not Info: this summary must survive the default log level so a
 		// failing run says something even when -v is absent.
 		log.Warn("finished with failures", "checks", len(checks), "successes", successes, "failures", n)
-		return 1
+		return 1, unknown.checks
 	}
 	log.Info("all checks passed", "checks", len(checks), "successes", successes)
-	return 0
+	return 0, nil
 }
 
 // runPass runs every check in checks concurrently (bounded by cmd.Concurrency).
 // A hard (non-retryable) failure is alerted and counted in failures at once;
 // a retryable failure is returned in the slice — not yet alerted or counted —
-// for the caller to retry. Successful checks are logged at debug.
+// for the caller to retry. A connect: ip check failing with an unknown host
+// key is alerted with its own reason and added to unknown. Successful checks
+// are logged at debug.
 func runPass(ctx context.Context, cmd CheckCmd, checks []Check, checkFn checker,
-	alerter Alerter, log *slog.Logger, failures *atomic.Int64) []softFail {
+	alerter Alerter, log *slog.Logger, failures *atomic.Int64, unknown *unknownKeyChecks) []softFail {
 	var (
 		mu   sync.Mutex
 		soft []softFail
@@ -466,7 +487,12 @@ func runPass(ctx context.Context, cmd CheckCmd, checks []Check, checkFn checker,
 					mu.Unlock()
 					continue
 				}
-				alerter.Alert(c, "check failed", err)
+				if c.Connect == connectIP && unknownHostKey(err) {
+					alerter.Alert(c, reasonHostKeyNotRecorded, err)
+					unknown.add(c)
+				} else {
+					alerter.Alert(c, "check failed", err)
+				}
 				failures.Add(1)
 			}
 		})
