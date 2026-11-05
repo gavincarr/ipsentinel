@@ -586,4 +586,11 @@ func TestKnownHostsClosingLine(t *testing.T) {
 			t.Errorf("stdout = %q, log:\n%s", out, l)
 		}
 	})
+	t.Run("no ip hosts", func(t *testing.T) {
+		out, l := run(t, "", func(string) fakeSSH { return fakeSSH{files: []string{shared}} })
+		if out != "" || !strings.Contains(l, "no connect: ip hosts in input") ||
+			strings.Contains(l, "nothing new to print") {
+			t.Errorf("stdout = %q, log:\n%s", out, l)
+		}
+	})
 }

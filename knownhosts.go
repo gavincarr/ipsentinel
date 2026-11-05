@@ -314,7 +314,8 @@ func runKnownHosts(r io.Reader, stripAll bool, domain string, config Config, log
 		log.Warn("finished with problems", "lines", lines, "problems", problems)
 	}
 	switch {
-	case lines == 0 && problems == 0:
+	case lines == 0 && problems == 0 && ipHosts > 0:
+		// Not when ipHosts == 0: the Warn above already said why.
 		log.Info("nothing new to print")
 	case lines > 0:
 		// Warn so it shows at the default level: the output is useless
