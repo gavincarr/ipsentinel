@@ -451,3 +451,139 @@ func TestRunKnownHostsNoneFiles(t *testing.T) {
 		t.Errorf("code = %d, stdout = %q\nlog:\n%s", code, stdout.String(), logbuf.String())
 	}
 }
+
+// TestPlanHostKeys checks the side-effect-free decision for each status,
+// with a nil printed map as `check` will call it.
+func TestPlanHostKeys(t *testing.T) {
+	needKeygen(t)
+	c := Check{Hostname: "web1", IP: "192.0.2.1"}
+	kA, kB := hostKey{"ssh-ed25519", strings.Fields(keyA)[1]}, hostKey{"ssh-ed25519", strings.Fields(keyB)[1]}
+	tests := []struct {
+		name       string
+		known      string
+		ssh        fakeSSH
+		printed    map[string][]hostKey
+		want       hostKeyStatus
+		wantAdd    []hostKey
+		wantErrMsg string
+		wantDiffer bool
+		wantHash   bool
+	}{
+		{name: "addable", known: "web1 " + keyA + "\n", want: hostKeyAddable, wantAdd: []hostKey{kA}},
+		{name: "addable hashed", known: "web1 " + keyA + "\n", ssh: fakeSSH{hash: true},
+			want: hostKeyAddable, wantAdd: []hostKey{kA}, wantHash: true},
+		{name: "partial add", known: "web1 " + keyA + "\nweb1 " + keyB + "\n192.0.2.1 " + keyA + "\n",
+			want: hostKeyAddable, wantAdd: []hostKey{kB}},
+		{name: "recorded", known: "web1 " + keyA + "\n192.0.2.1 " + keyA + "\n", want: hostKeyRecorded},
+		{name: "recorded by earlier print", known: "web1 " + keyA + "\n",
+			printed: map[string][]hostKey{"192.0.2.1": {kA}}, want: hostKeyRecorded},
+		{name: "aliased", known: "web1 " + keyA + "\n", ssh: fakeSSH{alias: "shared"}, want: hostKeyAliased},
+		{name: "no host key", known: "other " + keyA + "\n", want: hostKeyNoHostKey},
+		{name: "revoked", known: "web1 " + keyA + "\n@revoked web1 " + keyA + "\n", want: hostKeyRevoked},
+		{name: "foreign ip key", known: "web1 " + keyA + "\n192.0.2.1 " + keyB + "\n", want: hostKeyForeignIPKey},
+		{name: "ssh -G error", known: "web1 " + keyA + "\n", ssh: fakeSSH{err: errors.New("boom")},
+			want: hostKeyLookupError, wantErrMsg: "ssh -G failed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := writeKnownHosts(t, tt.known)
+			f := tt.ssh
+			f.files = []string{file}
+			env := realKnownHostsEnv()
+			env.sshConfig, env.salt = f.config, testSalt
+			p := planHostKeys(context.Background(), c, env, tt.printed)
+			if p.status != tt.want {
+				t.Fatalf("status = %d, want %d (%+v)", p.status, tt.want, p)
+			}
+			if !reflect.DeepEqual(p.add, tt.wantAdd) {
+				t.Errorf("add = %v, want %v", p.add, tt.wantAdd)
+			}
+			if p.errMsg != tt.wantErrMsg || (tt.wantErrMsg != "") != (p.err != nil) {
+				t.Errorf("errMsg = %q, err = %v; want %q", p.errMsg, p.err, tt.wantErrMsg)
+			}
+			if p.hash != tt.wantHash || p.userFilesDiffer != tt.wantDiffer {
+				t.Errorf("hash = %v, differ = %v", p.hash, p.userFilesDiffer)
+			}
+			switch tt.want {
+			case hostKeyAddable, hostKeyRecorded, hostKeyForeignIPKey:
+				if p.ipName != "192.0.2.1" || p.hostName != "web1" || p.ipUserFile != file {
+					t.Errorf("names/file = %q %q %q", p.hostName, p.ipName, p.ipUserFile)
+				}
+			}
+		})
+	}
+}
+
+// TestPlanHostKeysLookupError checks that a failing key lookup is reported
+// as a lookup error naming the failed step, with no logging side effects.
+func TestPlanHostKeysLookupError(t *testing.T) {
+	env := realKnownHostsEnv()
+	f := fakeSSH{files: []string{writeKnownHosts(t, "x\n")}}
+	env.sshConfig = f.config
+	env.keygenFind = func(context.Context, string, string) (string, error) { return "", errors.New("keygen boom") }
+	p := planHostKeys(context.Background(), Check{Hostname: "web1", IP: "192.0.2.1"}, env, nil)
+	if p.status != hostKeyLookupError || p.errMsg != "looking up host key failed" || p.errSide != "" {
+		t.Errorf("plan = %+v", p)
+	}
+}
+
+// TestPlanHostKeysFilesDiffer checks userFilesDiffer and ipUserFile.
+func TestPlanHostKeysFilesDiffer(t *testing.T) {
+	needKeygen(t)
+	hostFile := writeKnownHosts(t, "web1 "+keyA+"\n")
+	ipFile := writeKnownHosts(t, "")
+	f := fakeSSH{files: []string{ipFile}, hostFile: []string{hostFile}}
+	env := realKnownHostsEnv()
+	env.sshConfig = f.config
+	p := planHostKeys(context.Background(), Check{Hostname: "web1", IP: "192.0.2.1"}, env, nil)
+	if p.status != hostKeyAddable || !p.userFilesDiffer || p.ipUserFile != ipFile {
+		t.Errorf("plan = %+v", p)
+	}
+}
+
+// TestKnownHostsClosingLine checks the end-of-run Warn naming where printed
+// lines belong, and the Info for a run that printed nothing.
+func TestKnownHostsClosingLine(t *testing.T) {
+	needKeygen(t)
+	shared := writeKnownHosts(t, "web1 "+keyA+"\nweb2 "+keyB+"\n")
+	other := writeKnownHosts(t, "")
+	run := func(t *testing.T, input string, f func(hostname string) fakeSSH) (string, string) {
+		t.Helper()
+		env := realKnownHostsEnv()
+		env.sshConfig = func(ctx context.Context, hostname, ip string) (string, error) {
+			return f(hostname).config(ctx, hostname, ip)
+		}
+		env.salt = testSalt
+		var stdout, logbuf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&logbuf, nil))
+		runKnownHosts(strings.NewReader(input), false, "", Config{ConnectDefault: connectIP}, log, &stdout, env)
+		return stdout.String(), logbuf.String()
+	}
+	t.Run("one file", func(t *testing.T) {
+		_, l := run(t, "web1,192.0.2.1\nweb2,192.0.2.2\n", func(string) fakeSSH { return fakeSSH{files: []string{shared}} })
+		want := "level=WARN msg=\"printed 2 known_hosts lines for " + shared + "\""
+		if !strings.Contains(l, want) {
+			t.Errorf("log missing %q:\n%s", want, l)
+		}
+	})
+	t.Run("differing files", func(t *testing.T) {
+		_, l := run(t, "web1,192.0.2.1\nweb2,192.0.2.2\n", func(h string) fakeSSH {
+			if h == "web2" {
+				return fakeSSH{files: []string{other}, hostFile: []string{shared}}
+			}
+			return fakeSSH{files: []string{shared}}
+		})
+		want := "level=WARN msg=\"printed 2 known_hosts lines; they belong in each host's UserKnownHostsFile\""
+		if !strings.Contains(l, want) {
+			t.Errorf("log missing %q:\n%s", want, l)
+		}
+	})
+	t.Run("zero lines", func(t *testing.T) {
+		rec := writeKnownHosts(t, "web1 "+keyA+"\n192.0.2.1 "+keyA+"\n")
+		out, l := run(t, "web1,192.0.2.1\n", func(string) fakeSSH { return fakeSSH{files: []string{rec}} })
+		if out != "" || !strings.Contains(l, "level=INFO msg=\"nothing new to print\"") ||
+			strings.Contains(l, "known_hosts lines") {
+			t.Errorf("stdout = %q, log:\n%s", out, l)
+		}
+	})
+}

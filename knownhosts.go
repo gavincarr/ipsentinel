@@ -285,6 +285,9 @@ func runKnownHosts(r io.Reader, stripAll bool, domain string, config Config, log
 	// Keys printed this run, by plain ip name.
 	printed := make(map[string][]hostKey)
 	var lines, ipHosts int
+	// The ip side's first user known_hosts file for each host that printed
+	// lines ("" when it has none), to tell where the output belongs.
+	printedFiles := make(map[string]bool)
 
 	for _, c := range checks {
 		if c.Connect != connectIP {
@@ -292,8 +295,11 @@ func runKnownHosts(r io.Reader, stripAll bool, domain string, config Config, log
 			continue
 		}
 		ipHosts++
-		n, ok := knownHostsFor(ctx, c, env, log, w, printed)
+		n, file, ok := knownHostsFor(ctx, c, env, log, w, printed)
 		lines += n
+		if n > 0 {
+			printedFiles[file] = true
+		}
 		if !ok {
 			problems++
 		}
@@ -306,103 +312,213 @@ func runKnownHosts(r io.Reader, stripAll bool, domain string, config Config, log
 	}
 	if problems > 0 {
 		log.Warn("finished with problems", "lines", lines, "problems", problems)
+	}
+	switch {
+	case lines == 0 && problems == 0:
+		log.Info("nothing new to print")
+	case lines > 0:
+		// Warn so it shows at the default level: the output is useless
+		// until the user appends it somewhere, and new users won't know
+		// where. The file is only named when every printing host agrees.
+		if len(printedFiles) == 1 && !printedFiles[""] {
+			for f := range printedFiles {
+				log.Warn(fmt.Sprintf("printed %d known_hosts lines for %s", lines, f))
+			}
+		} else {
+			log.Warn(fmt.Sprintf("printed %d known_hosts lines; they belong in each host's UserKnownHostsFile", lines))
+		}
+	}
+	if problems > 0 {
 		return 1
 	}
-	log.Info("known_hosts lines printed", "lines", lines)
 	return 0
 }
 
-// knownHostsFor handles one connect: ip check, returning the number of
-// lines printed and whether it went without a problem (already logged).
-func knownHostsFor(ctx context.Context, c Check, env knownHostsEnv, log *slog.Logger,
-	w io.Writer, printed map[string][]hostKey) (int, bool) {
+// hostKeyStatus is the outcome of planHostKeys for one connect: ip check.
+type hostKeyStatus int
+
+const (
+	// hostKeyAliased: the ip side sets HostKeyAlias, so ssh already
+	// verifies the ip against the alias; nothing to do.
+	hostKeyAliased hostKeyStatus = iota
+	// hostKeyRecorded: every trusted host key is already recorded under the
+	// ip name (or was printed earlier in this run).
+	hostKeyRecorded
+	// hostKeyAddable: add holds at least one key to record under the ip name.
+	hostKeyAddable
+	// hostKeyNoHostKey: no key is known under the host's usual name.
+	hostKeyNoHostKey
+	// hostKeyRevoked: every host key is revoked under the host or ip name.
+	hostKeyRevoked
+	// hostKeyForeignIPKey: the ip name already holds a key that is not one
+	// of the host's.
+	hostKeyForeignIPKey
+	// hostKeyLookupError: ssh -G or a key lookup failed; see err, errSide
+	// and errMsg.
+	hostKeyLookupError
+)
+
+// hostKeyPlan is planHostKeys's decision for one host. Which fields are set
+// depends on status: names and files from the point the plan got that far.
+type hostKeyPlan struct {
+	status hostKeyStatus
+	// hostName and ipName are the plain (unhashed) known_hosts names.
+	hostName, ipName string
+	// ipUserFile is the ip side's first user known_hosts file, "" if none:
+	// where printed lines belong.
+	ipUserFile string
+	// userFilesDiffer: the ip side's user files differ from the host side's
+	// (and the ip side has some).
+	userFilesDiffer bool
+	// hash: the ip side has HashKnownHosts yes.
+	hash bool
+	// add holds, for hostKeyAddable, the keys to record, in order.
+	add []hostKey
+	// For hostKeyLookupError: the cause, which lookup failed ("ip" or "host"
+	// for ssh -G; "" otherwise) and the log message to use.
+	err     error
+	errSide string
+	errMsg  string
+}
+
+// planHostKeys decides what to do for one connect: ip check without logging,
+// printing or connecting to anything (ssh -G and ssh-keygen -F on local
+// files only), so `check` can reuse it to diagnose unknown-host-key
+// failures. printed holds keys already printed this run by plain ip name,
+// counted as recorded; nil means none.
+func planHostKeys(ctx context.Context, c Check, env knownHostsEnv, printed map[string][]hostKey) hostKeyPlan {
 	ipOut, err := env.sshConfig(ctx, c.Hostname, c.IP)
 	if err != nil {
-		log.Error("ssh -G failed", "side", "ip", "hostname", c.Hostname, "ip", c.IP, "err", err)
-		return 0, false
+		return hostKeyPlan{status: hostKeyLookupError, err: err, errSide: "ip", errMsg: "ssh -G failed"}
 	}
 	ipSide := parseSSHConfig(ipOut)
 	if alias := ipSide["hostkeyalias"]; alias != "" && alias != "none" {
-		log.Debug("hostkeyalias set; ssh already verifies the ip against it, skipping",
-			"hostname", c.Hostname, "ip", c.IP, "hostkeyalias", alias)
-		return 0, true
+		return hostKeyPlan{status: hostKeyAliased, ipName: alias}
 	}
 	hostOut, err := env.sshConfig(ctx, c.Hostname, "")
 	if err != nil {
-		log.Error("ssh -G failed", "side", "host", "hostname", c.Hostname, "ip", c.IP, "err", err)
-		return 0, false
+		return hostKeyPlan{status: hostKeyLookupError, err: err, errSide: "host", errMsg: "ssh -G failed"}
 	}
 	hostSide := parseSSHConfig(hostOut)
 	// A host-side HostKeyAlias is the name ssh files the host's key under,
 	// verbatim: no [ ]:port wrapping.
-	hostName := knownHostsName(hostSide["hostname"], hostSide["port"])
-	if alias := hostSide["hostkeyalias"]; alias != "" && alias != "none" {
-		hostName = alias
+	p := hostKeyPlan{
+		hostName: knownHostsName(hostSide["hostname"], hostSide["port"]),
+		ipName:   knownHostsName(c.IP, ipSide["port"]),
+		hash:     ipSide["hashknownhosts"] == "yes",
 	}
-	ipName := knownHostsName(c.IP, ipSide["port"])
+	if alias := hostSide["hostkeyalias"]; alias != "" && alias != "none" {
+		p.hostName = alias
+	}
 
 	// Each name is looked up in the files ssh consults for that side; they
 	// differ when a file name uses %h.
 	hostFiles, ipFiles := knownHostsFiles(hostSide), knownHostsFiles(ipSide)
-	if ipUser, hostUser := userKnownHostsFiles(ipSide), userKnownHostsFiles(hostSide); !slices.Equal(ipUser, hostUser) && len(ipUser) > 0 {
-		log.Warn("user known_hosts files differ between host and ip; the printed lines belong in the ip side's first user known_hosts file, not necessarily ~/.ssh/known_hosts",
-			"hostname", c.Hostname, "ip", c.IP, "file", ipUser[0])
+	ipUser, hostUser := userKnownHostsFiles(ipSide), userKnownHostsFiles(hostSide)
+	if len(ipUser) > 0 {
+		p.ipUserFile = ipUser[0]
+		p.userFilesDiffer = !slices.Equal(ipUser, hostUser)
 	}
 
-	hostKeys, hostRevoked, err := findKeys(ctx, env, hostName, hostFiles)
+	hostKeys, hostRevoked, err := findKeys(ctx, env, p.hostName, hostFiles)
 	if err != nil {
-		log.Error("looking up host key failed", "hostname", c.Hostname, "ip", c.IP, "name", hostName, "err", err)
-		return 0, false
+		p.status, p.err, p.errMsg = hostKeyLookupError, err, "looking up host key failed"
+		return p
 	}
 	if len(hostKeys) == 0 {
-		log.Error("no known host key for host; add it by hand, see README",
-			"hostname", c.Hostname, "ip", c.IP, "name", hostName)
-		return 0, false
+		p.status = hostKeyNoHostKey
+		return p
 	}
-	ipKeys, ipRevoked, err := findKeys(ctx, env, ipName, ipFiles)
+	ipKeys, ipRevoked, err := findKeys(ctx, env, p.ipName, ipFiles)
 	if err != nil {
-		log.Error("looking up ip key failed", "hostname", c.Hostname, "ip", c.IP, "name", ipName, "err", err)
-		return 0, false
+		p.status, p.err, p.errMsg = hostKeyLookupError, err, "looking up ip key failed"
+		return p
 	}
 	hostKeys = subtractKeys(subtractKeys(hostKeys, hostRevoked), ipRevoked)
 	if len(hostKeys) == 0 {
-		log.Error("host key revoked for host; not adding",
-			"hostname", c.Hostname, "ip", c.IP, "name", hostName)
-		return 0, false
+		p.status = hostKeyRevoked
+		return p
 	}
-	ipKeys = append(ipKeys, printed[ipName]...)
+	ipKeys = append(ipKeys, printed[p.ipName]...)
 	for _, k := range ipKeys {
 		if !slices.Contains(hostKeys, k) {
-			log.Error("ip already has a different host key; not adding",
-				"hostname", c.Hostname, "ip", c.IP, "name", ipName)
-			return 0, false
+			p.status = hostKeyForeignIPKey
+			return p
 		}
 	}
-
-	hash := ipSide["hashknownhosts"] == "yes"
-	var n int
 	for _, k := range hostKeys {
-		if slices.Contains(ipKeys, k) {
-			continue
+		if !slices.Contains(ipKeys, k) {
+			p.add = append(p.add, k)
 		}
-		field := ipName
-		if hash {
+	}
+	p.status = hostKeyRecorded
+	if len(p.add) > 0 {
+		p.status = hostKeyAddable
+	}
+	return p
+}
+
+// knownHostsFor handles one connect: ip check: it plans (planHostKeys), logs
+// per status, and prints the addable keys. It returns the number of lines
+// printed, the ip side's first user known_hosts file (where they belong),
+// and whether it went without a problem (already logged).
+func knownHostsFor(ctx context.Context, c Check, env knownHostsEnv, log *slog.Logger,
+	w io.Writer, printed map[string][]hostKey) (int, string, bool) {
+	p := planHostKeys(ctx, c, env, printed)
+	if p.userFilesDiffer {
+		log.Warn("user known_hosts files differ between host and ip; the printed lines belong in the ip side's first user known_hosts file, not necessarily ~/.ssh/known_hosts",
+			"hostname", c.Hostname, "ip", c.IP, "file", p.ipUserFile)
+	}
+	switch p.status {
+	case hostKeyAliased:
+		log.Debug("hostkeyalias set; ssh already verifies the ip against it, skipping",
+			"hostname", c.Hostname, "ip", c.IP, "hostkeyalias", p.ipName)
+		return 0, "", true
+	case hostKeyLookupError:
+		if p.errSide != "" {
+			log.Error(p.errMsg, "side", p.errSide, "hostname", c.Hostname, "ip", c.IP, "err", p.err)
+		} else {
+			name := p.hostName
+			if p.errMsg == "looking up ip key failed" {
+				name = p.ipName
+			}
+			log.Error(p.errMsg, "hostname", c.Hostname, "ip", c.IP, "name", name, "err", p.err)
+		}
+		return 0, "", false
+	case hostKeyNoHostKey:
+		log.Error("no known host key for host; add it by hand, see README",
+			"hostname", c.Hostname, "ip", c.IP, "name", p.hostName)
+		return 0, "", false
+	case hostKeyRevoked:
+		log.Error("host key revoked for host; not adding",
+			"hostname", c.Hostname, "ip", c.IP, "name", p.hostName)
+		return 0, "", false
+	case hostKeyForeignIPKey:
+		log.Error("ip already has a different host key; not adding",
+			"hostname", c.Hostname, "ip", c.IP, "name", p.ipName)
+		return 0, "", false
+	case hostKeyRecorded:
+		log.Debug("already recorded", "hostname", c.Hostname, "ip", c.IP, "name", p.ipName)
+		return 0, "", true
+	}
+
+	var n int
+	for _, k := range p.add {
+		field := p.ipName
+		if p.hash {
 			salt, err := env.salt()
 			if err != nil {
 				log.Error("generating salt failed", "hostname", c.Hostname, "ip", c.IP, "err", err)
-				return n, false
+				return n, p.ipUserFile, false
 			}
-			field = hashKnownHostsName(ipName, salt)
+			field = hashKnownHostsName(p.ipName, salt)
 		}
 		if _, err := fmt.Fprintf(w, "%s %s %s\n", field, k.typ, k.key); err != nil {
 			log.Error("writing output", "err", err)
-			return n, false
+			return n, p.ipUserFile, false
 		}
-		printed[ipName] = append(printed[ipName], k)
+		printed[p.ipName] = append(printed[p.ipName], k)
 		n++
 	}
-	if n == 0 {
-		log.Debug("already recorded", "hostname", c.Hostname, "ip", c.IP, "name", ipName)
-	}
-	return n, true
+	return n, p.ipUserFile, true
 }
